@@ -470,8 +470,6 @@ describe("OpenAI compact hooks", () => {
       const followupBody = jsonBody(calls[0]?.init)
       expect(calls[0]?.url).toBe("https://proxy.test/openai/v1/responses")
       expect(followupBody.input).toEqual([
-        { role: "developer", content: "stable instructions" },
-        { role: "system", content: "more stable instructions" },
         { type: "message", role: "user", content: "retained user" },
         {
           id: "cmp_compacted",
@@ -479,6 +477,8 @@ describe("OpenAI compact hooks", () => {
           encrypted_content: "compacted",
           internal_chat_message_metadata_passthrough: { turn_id: "turn_compacted" },
         },
+        { role: "developer", content: "stable instructions" },
+        { role: "system", content: "more stable instructions" },
         { role: "user", content: "after compact" },
       ])
 
@@ -499,6 +499,39 @@ describe("OpenAI compact hooks", () => {
       ]
       await hooks["experimental.chat.messages.transform"]?.({}, { messages: inferredProviderMessages } as any)
       expect(inferredProviderMessages.map((message) => message.info.id)).toEqual(["msg_after"])
+
+      calls.length = 0
+      await wrappedFetch("https://proxy.test/openai/v1/responses", {
+        method: "POST",
+        headers: {
+          [defaultConfig.headers.compact]: "1",
+          [defaultConfig.headers.session]: "ses_request",
+        },
+        body: JSON.stringify({
+          model: "ignored",
+          input: [
+            {
+              role: "developer",
+              content: "You are an anchored context summarization assistant for coding sessions.\n\nSummarize only...",
+            },
+            { role: "user", content: "after compact" },
+            { role: "user", content: "Create a new anchored summary from the conversation history.\n\nOutput exactly..." },
+          ],
+        }),
+      })
+
+      expect(jsonBody(calls[0]?.init).input).toEqual([
+        { role: "developer", content: "stable instructions" },
+        { role: "system", content: "more stable instructions" },
+        { type: "message", role: "user", content: "retained user" },
+        {
+          id: "cmp_compacted",
+          type: "compaction",
+          encrypted_content: "compacted",
+          internal_chat_message_metadata_passthrough: { turn_id: "turn_compacted" },
+        },
+        { role: "user", content: "after compact" },
+      ])
     } finally {
       store.close()
     }

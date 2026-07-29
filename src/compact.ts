@@ -179,10 +179,28 @@ function leadingInstructionCount(input: unknown[]) {
   }
 }
 
+function latestInstructionPrefix(input: unknown[]) {
+  let start = 0
+  for (let index = input.length - 1; index >= 0; index--) {
+    const type = asRecord(input[index])?.type
+    if (type === "compaction" || type === "compaction_summary") {
+      start = index + 1
+      break
+    }
+  }
+
+  let end = start
+  while (true) {
+    const role = asRecord(input[end])?.role
+    if (role !== "developer" && role !== "system") return input.slice(start, end)
+    end++
+  }
+}
+
 function stableInstructionsFrom(body: AnyRecord | undefined): StableInstructions | undefined {
   if (!body) return undefined
 
-  const inputPrefix = Array.isArray(body.input) ? body.input.slice(0, leadingInstructionCount(body.input)) : []
+  const inputPrefix = Array.isArray(body.input) ? latestInstructionPrefix(body.input) : []
   const instructions = isOpenCodeCompactionDeveloperPrompt(body.instructions) ? undefined : body.instructions
   if (instructions === undefined && !inputPrefix.length) return undefined
   return { instructions, inputPrefix: structuredClone(inputPrefix) }
@@ -567,8 +585,8 @@ export function createCompactHooks(
     const next = {
       ...body,
       input: [
-        ...body.input.slice(0, instructionCount),
         ...structuredClone(checkpoint.items),
+        ...body.input.slice(0, instructionCount),
         ...body.input.slice(instructionCount),
       ],
     }
