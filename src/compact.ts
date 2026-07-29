@@ -164,7 +164,7 @@ function compactInput(value: unknown) {
 
 function compactBodyValue(key: string, value: unknown) {
   if (key === "input") return compactInput(value)
-  if (key === "instructions" && isOpenCodeCompactionDeveloperPrompt(value)) return undefined
+  if (key === "instructions" && (value === "" || isOpenCodeCompactionDeveloperPrompt(value))) return undefined
   return value
 }
 
@@ -214,6 +214,7 @@ export function compactBody(
 ): AnyRecord {
   const result: AnyRecord = { model: compactModel }
   for (const key of config.compactBodyKeys) {
+    if (key === "model") continue
     const value = compactBodyValue(key, body[key])
     if (value !== undefined) result[key] = value
   }
@@ -629,17 +630,17 @@ export function createCompactHooks(
 
       const outboundCompactHeaders = new Headers(routedRequestInit.headers)
       outboundCompactHeaders.set("content-type", "application/json")
+      const compactRequestBody = withStableInstructions(
+        compactBody(body, provider.compactModel, config),
+        stableInstructionsByProvider.get(providerID)?.get(sessionID),
+        config.compactBodyKeys.includes("instructions"),
+      )
+      if (providerID === "openai" && !openAIOAuthRequestInit) delete compactRequestBody.service_tier
       const compacted = await baseFetch(openAIOAuthRequestInit ? chatGPTCodexCompactEndpoint : compactUrl(url, config), {
         ...routedRequestInit,
         method: "POST",
         headers: outboundCompactHeaders,
-        body: JSON.stringify(
-          withStableInstructions(
-            compactBody(body, provider.compactModel, config),
-            stableInstructionsByProvider.get(providerID)?.get(sessionID),
-            config.compactBodyKeys.includes("instructions"),
-          ),
-        ),
+        body: JSON.stringify(compactRequestBody),
       })
       if (!compacted.ok) {
         return compacted

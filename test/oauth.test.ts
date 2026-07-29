@@ -80,10 +80,17 @@ describe("OpenAI OAuth hooks", () => {
           [defaultConfig.headers.compact]: "1",
           [defaultConfig.headers.session]: "ses_api",
         },
-        body: JSON.stringify({ model: "ignored", input: [{ role: "user", content: "hello" }] }),
+        body: JSON.stringify({
+          model: "ignored",
+          input: [{ role: "user", content: "hello" }],
+          service_tier: "priority",
+          prompt_cache_key: "cache-key",
+        }),
       })
 
       expect(calls[0]?.url).toBe("https://api.openai.com/v1/responses/compact")
+      expect(jsonBody(calls[0]?.init)).toMatchObject({ prompt_cache_key: "cache-key" })
+      expect(jsonBody(calls[0]?.init)).not.toHaveProperty("service_tier")
       expect(store.count()).toBe(1)
 
       await hooks.event?.({
@@ -311,7 +318,12 @@ describe("OpenAI OAuth hooks", () => {
           [defaultConfig.headers.compact]: "1",
           [defaultConfig.headers.session]: "ses_oauth",
         },
-        body: JSON.stringify({ model: "ignored", input: [{ role: "user", content: "hello" }] }),
+        body: JSON.stringify({
+          model: "ignored",
+          input: [{ role: "user", content: "hello" }],
+          service_tier: "priority",
+          prompt_cache_key: "cache-key",
+        }),
       })
 
       expect(calls[0]?.url).toBe("https://chatgpt.com/backend-api/codex/responses/compact")
@@ -320,6 +332,10 @@ describe("OpenAI OAuth hooks", () => {
       expect(headers.get("chatgpt-account-id")).toBe("acct_test")
       expect(headers.has(defaultConfig.headers.compact)).toBe(false)
       expect(headers.has(defaultConfig.headers.session)).toBe(false)
+      expect(jsonBody(calls[0]?.init)).toMatchObject({
+        service_tier: "priority",
+        prompt_cache_key: "cache-key",
+      })
     } finally {
       store.close()
     }

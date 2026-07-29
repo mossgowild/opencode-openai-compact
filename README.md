@@ -120,10 +120,12 @@ The default retention is 30 days. Checkpoints are deleted when OpenCode emits `s
   "compactBodyKeys": [
     "input",
     "instructions",
-    "previous_response_id",
+    "tools",
+    "parallel_tool_calls",
+    "reasoning",
+    "service_tier",
     "prompt_cache_key",
-    "prompt_cache_retention",
-    "service_tier"
+    "text"
   ],
   "summary": "Context compacted.\nFollowing conversations will continue from this compacted checkpoint.",
   "state": {

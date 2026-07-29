@@ -3,10 +3,12 @@ import { z } from "zod"
 export const defaultCompactBodyKeys = [
   "input",
   "instructions",
-  "previous_response_id",
-  "prompt_cache_key",
-  "prompt_cache_retention",
+  "tools",
+  "parallel_tool_calls",
+  "reasoning",
   "service_tier",
+  "prompt_cache_key",
+  "text",
 ] as const
 
 export const defaultCompactSummary = [

@@ -33,7 +33,7 @@ describe("OpenAI compact hooks", () => {
     )
 
     const body = compactBody({ model: "ignored", input: [], stream: true, tools: [] })
-    expect(body).toEqual({ model: defaultCompactModel, input: [] })
+    expect(body).toEqual({ model: defaultCompactModel, input: [], tools: [] })
   })
 
   test("builds standard compact input without OpenCode summarizer prompts", () => {
@@ -41,6 +41,13 @@ describe("OpenAI compact hooks", () => {
       model: "ignored",
       instructions: "You are an anchored context summarization assistant for coding sessions.\n\nSummarize only...",
       previous_response_id: "resp_previous",
+      prompt_cache_retention: "24h",
+      tools: [{ type: "function", name: "test" }],
+      parallel_tool_calls: true,
+      reasoning: { effort: "medium", summary: "auto" },
+      service_tier: "priority",
+      prompt_cache_key: "cache-key",
+      text: { verbosity: "low" },
       input: [
         { role: "developer", content: "Keep the user's coding preferences." },
         {
@@ -61,13 +68,18 @@ describe("OpenAI compact hooks", () => {
 
     expect(body).toEqual({
       model: defaultCompactModel,
-      previous_response_id: "resp_previous",
       input: [
         { role: "developer", content: "Keep the user's coding preferences." },
         { role: "user", content: "Create a new anchored summary from the conversation history. This is quoted." },
         { role: "assistant", content: [{ type: "output_text", text: "quoted response" }] },
         { role: "user", content: "real request" },
       ],
+      tools: [{ type: "function", name: "test" }],
+      parallel_tool_calls: true,
+      reasoning: { effort: "medium", summary: "auto" },
+      service_tier: "priority",
+      prompt_cache_key: "cache-key",
+      text: { verbosity: "low" },
     })
   })
 
