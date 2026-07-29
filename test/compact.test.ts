@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest"
-import { compactBody, compactUrl, createCompactHooks } from "../src/compact.js"
+import { compactBody, compactedItemsFrom, compactUrl, createCompactHooks } from "../src/compact.js"
 import { defaultConfig, OpenAICompactConfigSchema } from "../src/schema.js"
 import { CheckpointStore } from "../src/state.js"
 
@@ -81,6 +81,39 @@ describe("OpenAI compact hooks", () => {
       prompt_cache_key: "cache-key",
       text: { verbosity: "low" },
     })
+  })
+
+  test("normalizes exactly one compaction while preserving passthrough fields", () => {
+    expect(
+      compactedItemsFrom([
+        { type: "message", role: "developer", content: "stale developer context" },
+        { type: "message", role: "system", content: "stale system context" },
+        { type: "message", role: "user", content: "retained user" },
+        {
+          id: "cmp_123",
+          type: "compaction_summary",
+          encrypted_content: "compacted",
+          internal_chat_message_metadata_passthrough: { turn_id: "turn_123" },
+          status: "completed",
+        },
+      ]),
+    ).toEqual([
+      { type: "message", role: "user", content: "retained user" },
+      {
+        id: "cmp_123",
+        type: "compaction",
+        encrypted_content: "compacted",
+        internal_chat_message_metadata_passthrough: { turn_id: "turn_123" },
+        status: "completed",
+      },
+    ])
+    expect(compactedItemsFrom([{ type: "message", role: "user", content: "no compaction" }])).toBeUndefined()
+    expect(
+      compactedItemsFrom([
+        { type: "compaction", encrypted_content: "first" },
+        { type: "compaction_summary", encrypted_content: "second" },
+      ]),
+    ).toBeUndefined()
   })
 
   test("keeps session instructions when routing compaction", async () => {
@@ -370,7 +403,17 @@ describe("OpenAI compact hooks", () => {
           id: "resp_compacted",
           model: defaultCompactModel,
           created_at: 1,
-          output: [{ type: "compaction_summary", encrypted_content: "compacted" }],
+          output: [
+            { type: "message", role: "developer", content: "stale developer context" },
+            { type: "message", role: "system", content: "stale system context" },
+            { type: "message", role: "user", content: "retained user" },
+            {
+              id: "cmp_compacted",
+              type: "compaction_summary",
+              encrypted_content: "compacted",
+              internal_chat_message_metadata_passthrough: { turn_id: "turn_compacted" },
+            },
+          ],
         }),
         { status: 200, headers: { "content-type": "application/json" } },
       )
@@ -429,7 +472,13 @@ describe("OpenAI compact hooks", () => {
       expect(followupBody.input).toEqual([
         { role: "developer", content: "stable instructions" },
         { role: "system", content: "more stable instructions" },
-        { type: "compaction", encrypted_content: "compacted" },
+        { type: "message", role: "user", content: "retained user" },
+        {
+          id: "cmp_compacted",
+          type: "compaction",
+          encrypted_content: "compacted",
+          internal_chat_message_metadata_passthrough: { turn_id: "turn_compacted" },
+        },
         { role: "user", content: "after compact" },
       ])
 
@@ -450,6 +499,46 @@ describe("OpenAI compact hooks", () => {
       ]
       await hooks["experimental.chat.messages.transform"]?.({}, { messages: inferredProviderMessages } as any)
       expect(inferredProviderMessages.map((message) => message.info.id)).toEqual(["msg_after"])
+    } finally {
+      store.close()
+    }
+  })
+
+  test.each([
+    ["no compaction", []],
+    [
+      "multiple compactions",
+      [
+        { type: "compaction", encrypted_content: "first" },
+        { type: "compaction_summary", encrypted_content: "second" },
+      ],
+    ],
+  ])("rejects compact output with %s", async (_name, output) => {
+    const store = CheckpointStore.openMemory()
+    const fakeFetch = (async () =>
+      new Response(JSON.stringify({ id: "resp_invalid", output }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })) as typeof fetch
+
+    try {
+      const hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+      const cfg: any = {}
+      await hooks.config?.(cfg)
+      const wrappedFetch = cfg.provider.openai.options.fetch as typeof fetch
+
+      const response = await wrappedFetch("https://api.openai.com/v1/responses", {
+        method: "POST",
+        headers: {
+          [defaultConfig.headers.compact]: "1",
+          [defaultConfig.headers.session]: "ses_invalid",
+        },
+        body: JSON.stringify({ model: "ignored", input: [{ role: "user", content: "hello" }] }),
+      })
+
+      expect(response.status).toBe(502)
+      expect(await response.text()).toContain("exactly one valid compaction item")
+      expect(store.count()).toBe(0)
     } finally {
       store.close()
     }

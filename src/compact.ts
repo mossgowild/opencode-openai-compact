@@ -9,7 +9,9 @@ import {
   type OpenAIOAuthAuth,
   type OAuthFetchLike,
 } from "./oauth.js"
-import { CheckpointStore, type AnyRecord, type Checkpoint } from "./state.js"
+import { CheckpointStore, compactedItemsFrom, type AnyRecord, type Checkpoint } from "./state.js"
+
+export { compactedItemsFrom } from "./state.js"
 
 type FetchLike = typeof fetch
 type MessageEntry = {
@@ -219,19 +221,6 @@ export function compactBody(
     if (value !== undefined) result[key] = value
   }
   return result
-}
-
-export function compactedItemsFrom(value: unknown): AnyRecord[] | undefined {
-  if (!Array.isArray(value)) return undefined
-  const items = value
-    .map(asRecord)
-    .filter((item): item is AnyRecord => item !== undefined)
-    .map((item) =>
-      item.type === "compaction_summary" && typeof item.encrypted_content === "string"
-        ? { type: "compaction", encrypted_content: item.encrypted_content }
-        : item,
-    )
-  return items.length ? items : undefined
 }
 
 function parseJsonRecord(text: string | undefined): AnyRecord | undefined {
@@ -647,9 +636,12 @@ export function createCompactHooks(
       }
 
       const payload = asRecord(await compacted.clone().json().catch(() => undefined))
-      const responseID = typeof payload?.id === "string" ? payload.id : undefined
       const items = compactedItemsFrom(payload?.output)
-      if (!responseID || !items) {
+      if (!items) {
+        return new Response("OpenAI compact response must contain exactly one valid compaction item", { status: 502 })
+      }
+      const responseID = typeof payload?.id === "string" ? payload.id : undefined
+      if (!responseID) {
         return compacted
       }
 

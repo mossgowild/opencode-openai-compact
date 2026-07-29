@@ -73,6 +73,54 @@ describe("CheckpointStore", () => {
     }
   })
 
+  test("normalizes persisted compaction summaries and rejects invalid checkpoints", () => {
+    const store = CheckpointStore.openMemory()
+    try {
+      store.upsert("ses", {
+        providerID: "openai",
+        responseID: "resp_legacy",
+        afterMessageID: "msg_legacy",
+        afterCreatedAt: 1,
+        createdAt: Date.now(),
+        items: [
+          { type: "message", role: "developer", content: "stale developer context" },
+          { type: "message", role: "user", content: "retained user" },
+          {
+            id: "cmp_legacy",
+            type: "compaction_summary",
+            encrypted_content: "legacy",
+            internal_chat_message_metadata_passthrough: { turn_id: "turn_legacy" },
+          },
+        ],
+      })
+      store.upsert("ses", {
+        providerID: "openai",
+        responseID: "resp_invalid",
+        afterMessageID: "msg_invalid",
+        afterCreatedAt: 2,
+        createdAt: Date.now(),
+        items: [
+          { type: "compaction", encrypted_content: "first" },
+          { type: "compaction", encrypted_content: "second" },
+        ],
+      })
+
+      const checkpoints = store.loadAll().filter((entry) => entry.sessionID === "ses")
+      expect(checkpoints).toHaveLength(1)
+      expect(checkpoints[0].checkpoint.items).toEqual([
+        { type: "message", role: "user", content: "retained user" },
+        {
+          id: "cmp_legacy",
+          type: "compaction",
+          encrypted_content: "legacy",
+          internal_chat_message_metadata_passthrough: { turn_id: "turn_legacy" },
+        },
+      ])
+    } finally {
+      store.close()
+    }
+  })
+
   test("uses WAL mode with sidecar files for file databases", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "opencode-openai-compact-"))
     const file = path.join(root, "checkpoints.db")

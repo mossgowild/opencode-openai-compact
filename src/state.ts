@@ -30,21 +30,29 @@ function asRecord(value: unknown): AnyRecord | undefined {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as AnyRecord) : undefined
 }
 
-function itemsFrom(value: unknown): AnyRecord[] | undefined {
+export function compactedItemsFrom(value: unknown): AnyRecord[] | undefined {
   if (!Array.isArray(value)) return undefined
-  const items = value
-    .map(asRecord)
-    .filter((item): item is AnyRecord => item !== undefined)
-    .map((item) =>
-      item.type === "compaction_summary" && typeof item.encrypted_content === "string"
-        ? { type: "compaction", encrypted_content: item.encrypted_content }
-        : item,
-    )
-  return items.length ? items : undefined
+  const items: AnyRecord[] = []
+  for (const valueItem of value) {
+    const record = asRecord(valueItem)
+    if (!record) continue
+
+    let item = record
+    if (item.type === "compaction_summary") {
+      if (typeof item.encrypted_content !== "string") return undefined
+      item = { ...item, type: "compaction" }
+    }
+    if (item.role === "developer" || item.role === "system") continue
+    items.push(item)
+  }
+
+  const compactions = items.filter((item) => item.type === "compaction")
+  if (compactions.length !== 1 || typeof compactions[0].encrypted_content !== "string") return undefined
+  return items
 }
 
 function checkpointFromRow(row: CheckpointRow): Checkpoint | undefined {
-  const items = itemsFrom(JSON.parse(row.items_json))
+  const items = compactedItemsFrom(JSON.parse(row.items_json))
   if (!items) return undefined
   return {
     providerID: row.provider_id,
