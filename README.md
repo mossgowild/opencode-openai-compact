@@ -175,11 +175,11 @@ The default retention is 30 days. Checkpoints are deleted when OpenCode emits `s
 ## Star Us On GitHub
 
 <p align="center">
-  <a href="https://www.star-history.com/#partment/opencode-openai-compact&type=date&legend=bottom-right">
+  <a href="https://www.star-history.com/?type=date&legend=bottom-right&repos=partment%2Fopencode-openai-compact">
     <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=partment%2Fopencode-openai-compact&type=date&theme=dark&legend=bottom-right&sealed_token=b_3TR5-_wZLR4jqnK5zrIwbY_0TZKLLuNEi7PJ5KQDcCTy3UvdjrNUxLybd-4n9ekuAu7y1dfEvmXgzdrUGVKYe8ycn4L4lOEbuaupbR8M1mofa2cD7Gx2t9Taj9ZV3dW0dp0WE16xGp_E3p26a2EvpDcAbiYu4Ky1gZy9C8GrOHjSoY2m2Gv495wA7W" />
-      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=partment%2Fopencode-openai-compact&type=date&legend=bottom-right&sealed_token=b_3TR5-_wZLR4jqnK5zrIwbY_0TZKLLuNEi7PJ5KQDcCTy3UvdjrNUxLybd-4n9ekuAu7y1dfEvmXgzdrUGVKYe8ycn4L4lOEbuaupbR8M1mofa2cD7Gx2t9Taj9ZV3dW0dp0WE16xGp_E3p26a2EvpDcAbiYu4Ky1gZy9C8GrOHjSoY2m2Gv495wA7W" />
-      <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=partment%2Fopencode-openai-compact&type=date&legend=bottom-right&sealed_token=b_3TR5-_wZLR4jqnK5zrIwbY_0TZKLLuNEi7PJ5KQDcCTy3UvdjrNUxLybd-4n9ekuAu7y1dfEvmXgzdrUGVKYe8ycn4L4lOEbuaupbR8M1mofa2cD7Gx2t9Taj9ZV3dW0dp0WE16xGp_E3p26a2EvpDcAbiYu4Ky1gZy9C8GrOHjSoY2m2Gv495wA7W" />
+      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=partment/opencode-openai-compact&type=date&theme=dark&legend=bottom-right&sealed_token=B1P0xeMCKz6n5QMyiC8UosMAD2wW5_RlxtLF4oF9jDSlwYyHsd1Mk59iIJ8dpCmuECo1AbQkF4H48Lq2fDdJqwqq4TOCVRlmMCiBDct6vXpJ7zcy6qeT1v1KlcNeI7MlZF8h9x-FNoDp4Dl8Ve3bJTQhGn8G9VQT7ANV4ZCaVj7u2XVeiudddp-9LCC9" />
+      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=partment/opencode-openai-compact&type=date&legend=bottom-right&sealed_token=B1P0xeMCKz6n5QMyiC8UosMAD2wW5_RlxtLF4oF9jDSlwYyHsd1Mk59iIJ8dpCmuECo1AbQkF4H48Lq2fDdJqwqq4TOCVRlmMCiBDct6vXpJ7zcy6qeT1v1KlcNeI7MlZF8h9x-FNoDp4Dl8Ve3bJTQhGn8G9VQT7ANV4ZCaVj7u2XVeiudddp-9LCC9" />
+      <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=partment/opencode-openai-compact&type=date&legend=bottom-right&sealed_token=B1P0xeMCKz6n5QMyiC8UosMAD2wW5_RlxtLF4oF9jDSlwYyHsd1Mk59iIJ8dpCmuECo1AbQkF4H48Lq2fDdJqwqq4TOCVRlmMCiBDct6vXpJ7zcy6qeT1v1KlcNeI7MlZF8h9x-FNoDp4Dl8Ve3bJTQhGn8G9VQT7ANV4ZCaVj7u2XVeiudddp-9LCC9" />
     </picture>
   </a>
 </p>
