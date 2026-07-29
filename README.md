@@ -8,6 +8,8 @@ Use OpenAI's official Responses API `/responses/compact` in OpenCode.
 
 OpenCode can compact long coding sessions. When you are using OpenAI Responses models, this plugin routes compaction through OpenAI's native compact endpoint instead of asking another model to write a text summary.
 
+![Hero image introducing this plugin.](/assets/images/hero.webp)
+
 ## Why Native Compaction
 
 | Default prompt summary | OpenAI native compaction |
