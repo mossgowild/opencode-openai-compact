@@ -442,16 +442,14 @@ describe("OpenAI compact hooks", () => {
       expect(new Headers(calls[0]?.init?.headers).has(defaultConfig.headers.compact)).toBe(false)
       expect(new Headers(calls[0]?.init?.headers).has(defaultConfig.headers.session)).toBe(false)
 
-      await hooks.event?.({
-        event: {
-          type: "message.part.updated",
-          properties: {
-            sessionID: "ses_request",
-            part: { messageID: "msg_checkpoint", type: "text", text: defaultConfig.summary },
-            time: 2,
-          },
-        } as any,
-      })
+      const messagesBeforeBoundaryEvent = [
+        { info: { id: "msg_original", sessionID: "ses_request", time: { created: 1 } }, parts: [] },
+      ]
+      await hooks["experimental.chat.messages.transform"]?.(
+        { model: { providerID: "openai" } } as any,
+        { messages: messagesBeforeBoundaryEvent } as any,
+      )
+      expect(messagesBeforeBoundaryEvent).toHaveLength(1)
 
       calls.length = 0
       await wrappedFetch("https://proxy.test/openai/v1/responses", {
@@ -462,7 +460,19 @@ describe("OpenAI compact hooks", () => {
           input: [
             { role: "developer", content: "stable instructions" },
             { role: "system", content: "more stable instructions" },
+            { role: "user", content: [{ type: "input_text", text: "retained user" }] },
+            { role: "user", content: [{ type: "input_text", text: "What did we do so far?" }] },
+            { role: "assistant", content: [{ type: "output_text", text: defaultConfig.summary }] },
             { role: "user", content: "after compact" },
+            {
+              role: "user",
+              content: [
+                {
+                  type: "input_text",
+                  text: "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.",
+                },
+              ],
+            },
           ],
         }),
       })
@@ -482,6 +492,17 @@ describe("OpenAI compact hooks", () => {
         { role: "user", content: "after compact" },
       ])
 
+      await hooks.event?.({
+        event: {
+          type: "message.part.updated",
+          properties: {
+            sessionID: "ses_request",
+            part: { messageID: "msg_checkpoint", type: "text", text: defaultConfig.summary },
+            time: 2,
+          },
+        } as any,
+      })
+
       const unknownProviderMessages = [
         { info: { id: "msg_checkpoint", sessionID: "ses_request" } },
         { info: { id: "msg_after", sessionID: "ses_request" } },
@@ -495,6 +516,10 @@ describe("OpenAI compact hooks", () => {
       )
       const inferredProviderMessages = [
         { info: { id: "msg_checkpoint", sessionID: "ses_request" } },
+        {
+          info: { id: "msg_continue", sessionID: "ses_request" },
+          parts: [{ type: "text", synthetic: true, metadata: { compaction_continue: true } }],
+        },
         { info: { id: "msg_after", sessionID: "ses_request" } },
       ]
       await hooks["experimental.chat.messages.transform"]?.({}, { messages: inferredProviderMessages } as any)

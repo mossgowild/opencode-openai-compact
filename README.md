@@ -28,6 +28,7 @@ The important part is simple: `/responses/compact` returns compacted output that
 3. Removes OpenCode's internal summary prompt from the compact request body.
 4. Stores the compacted output in a local SQLite checkpoint.
 5. Injects that checkpoint into the next `/responses` request for the same session.
+6. Replaces OpenCode's synthetic post-compaction exchange with the active checkpoint while preserving later real messages.
 
 ## When To Use It
 

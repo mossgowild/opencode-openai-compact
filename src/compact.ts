@@ -16,7 +16,14 @@ export { compactedItemsFrom } from "./state.js"
 type FetchLike = typeof fetch
 type MessageEntry = {
   info?: { id?: string; sessionID?: string; time?: { created?: number } }
-  parts?: Array<{ type?: string; text?: string; messageID?: string; time?: { start?: number } }>
+  parts?: Array<{
+    type?: string
+    text?: string
+    messageID?: string
+    synthetic?: boolean
+    metadata?: AnyRecord
+    time?: { start?: number }
+  }>
 }
 type MessageBoundary = { messageID: string; createdAt: number }
 type PendingCompactResult = { providerID: string; responseID: string; items: AnyRecord[] }
@@ -37,6 +44,9 @@ const openCodeCompactionUserPromptStarts = [
   "Create a new anchored summary from the conversation history.",
   "Update the anchored summary below using the conversation history above.",
 ] as const
+const openCodeCompactionQuestion = "What did we do so far?"
+const openCodeCompactionContinuation =
+  "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed."
 
 function asRecord(value: unknown): AnyRecord | undefined {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as AnyRecord) : undefined
@@ -162,6 +172,24 @@ function compactInput(value: unknown) {
     }
     return true
   })
+}
+
+function messageHasText(value: unknown, role: "assistant" | "user", text: string) {
+  const message = asRecord(value)
+  return message?.role === role && contentText(message.content) === text
+}
+
+function postCompactionInput(input: unknown[], summary: string) {
+  const start = input.findIndex(
+    (item, index) =>
+      messageHasText(item, "user", openCodeCompactionQuestion) &&
+      messageHasText(input[index + 1], "assistant", summary),
+  )
+  if (start === -1) return input
+
+  const result = [...input.slice(0, leadingInstructionCount(input)), ...input.slice(start + 2)]
+  if (messageHasText(result.at(-1), "user", openCodeCompactionContinuation)) result.pop()
+  return result
 }
 
 function compactBodyValue(key: string, value: unknown) {
@@ -329,6 +357,12 @@ function sseResponse(input: {
 function messageCreatedAt(entry: MessageEntry) {
   const createdAt = entry.info?.time?.created
   return finiteNumber(createdAt) ? createdAt : undefined
+}
+
+function isOpenCodeCompactionContinuation(entry: MessageEntry) {
+  return entry.parts?.some(
+    (part) => part.type === "text" && part.synthetic === true && part.metadata?.compaction_continue === true,
+  )
 }
 
 function selectCheckpoint(
@@ -551,7 +585,7 @@ export function createCompactHooks(
     const activeCheckpoints = getProviderSessionMap(activeCheckpointByProvider, providerID)
     if (checkpoint) {
       activeCheckpoints.set(sessionID, checkpoint)
-    } else if (clearActive) {
+    } else if (clearActive && pendingCompactResults.get(sessionID)?.providerID !== providerID) {
       activeCheckpoints.delete(sessionID)
     }
     if (!checkpoint) return
@@ -559,10 +593,8 @@ export function createCompactHooks(
     const index = messages.findIndex((message) => message.info?.id === checkpoint.afterMessageID)
     if (index === -1) return
 
-    const trimmed = messages.slice(index + 1)
-    if (trimmed.length) {
-      messages.splice(0, messages.length, ...trimmed)
-    }
+    const trimmed = messages.slice(index + 1).filter((message) => !isOpenCodeCompactionContinuation(message))
+    messages.splice(0, messages.length, ...trimmed)
   }
 
   async function initWithCompactedInput(
@@ -581,14 +613,10 @@ export function createCompactHooks(
     if (!checkpoint) return fetchInitForReroute(requestInput, init, headers)
 
     headers.set("content-type", "application/json")
-    const instructionCount = leadingInstructionCount(body.input)
+    const input = postCompactionInput(body.input, config.summary)
     const next = {
       ...body,
-      input: [
-        ...structuredClone(checkpoint.items),
-        ...body.input.slice(0, instructionCount),
-        ...body.input.slice(instructionCount),
-      ],
+      input: [...structuredClone(checkpoint.items), ...input],
     }
     return { ...fetchInitForReroute(requestInput, init, headers), body: JSON.stringify(next) }
   }
