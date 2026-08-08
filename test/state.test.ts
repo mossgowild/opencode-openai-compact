@@ -66,6 +66,11 @@ describe("CheckpointStore", () => {
       })
       expect(store.loadAll().filter((entry) => entry.sessionID === "ses")).toHaveLength(2)
 
+      store.deleteCheckpoint("ses", "openai", "resp_new")
+      expect(store.loadAll().filter((entry) => entry.sessionID === "ses").map((entry) => entry.checkpoint.providerID)).toEqual([
+        "custom-openai",
+      ])
+
       store.deleteSession("ses")
       expect(store.loadAll().some((entry) => entry.sessionID === "ses")).toBe(false)
     } finally {

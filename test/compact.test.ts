@@ -562,6 +562,97 @@ describe("OpenAI compact hooks", () => {
     }
   })
 
+  test("keeps checkpoints through undo and redo until undo removes the boundary", async () => {
+    const store = CheckpointStore.openMemory()
+    const calls: Array<{ url: string; init?: RequestInit }> = []
+    const fakeFetch = (async (requestInput: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(requestInput), init })
+      return new Response(
+        JSON.stringify({
+          id: "resp_undo",
+          model: defaultCompactModel,
+          created_at: 1,
+          output: [{ type: "compaction_summary", encrypted_content: "undo-compacted" }],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      )
+    }) as typeof fetch
+
+    try {
+      const hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+      const cfg: any = {}
+      await hooks.config?.(cfg)
+      const wrappedFetch = cfg.provider.openai.options.fetch as typeof fetch
+
+      await wrappedFetch("https://proxy.test/openai/v1/responses", {
+        method: "POST",
+        headers: {
+          [defaultConfig.headers.compact]: "1",
+          [defaultConfig.headers.session]: "ses_undo",
+        },
+        body: JSON.stringify({ model: "ignored", input: [{ role: "user", content: "before compact" }] }),
+      })
+      await hooks.event?.({
+        event: {
+          type: "message.part.updated",
+          properties: {
+            sessionID: "ses_undo",
+            part: { messageID: "msg_checkpoint", type: "text", text: defaultConfig.summary },
+            time: 2,
+          },
+        } as any,
+      })
+      expect(store.count()).toBe(1)
+
+      await hooks.event?.({
+        event: {
+          type: "session.updated",
+          properties: { sessionID: "ses_undo", info: { id: "ses_undo", revert: { messageID: "msg_before" } } },
+        } as any,
+      })
+      expect(store.count()).toBe(1)
+
+      await hooks.event?.({
+        event: { type: "session.updated", properties: { sessionID: "ses_undo", info: { id: "ses_undo" } } } as any,
+      })
+
+      calls.length = 0
+      await wrappedFetch("https://proxy.test/openai/v1/responses", {
+        method: "POST",
+        headers: { [defaultConfig.headers.session]: "ses_undo" },
+        body: JSON.stringify({ model: "gpt", input: [{ role: "user", content: "after redo" }] }),
+      })
+      expect(jsonBody(calls[0]?.init).input).toEqual([
+        { type: "compaction", encrypted_content: "undo-compacted" },
+        { role: "user", content: "after redo" },
+      ])
+
+      await hooks.event?.({
+        event: {
+          type: "message.removed",
+          properties: { sessionID: "ses_undo", messageID: "msg_after_checkpoint" },
+        } as any,
+      })
+      expect(store.count()).toBe(1)
+
+      await hooks.event?.({
+        event: { type: "message.removed", properties: { sessionID: "ses_undo", messageID: "msg_checkpoint" } } as any,
+      })
+      expect(store.count()).toBe(0)
+
+      calls.length = 0
+      const afterCommittedUndo = [{ role: "user", content: "new branch" }]
+      await wrappedFetch("https://proxy.test/openai/v1/responses", {
+        method: "POST",
+        headers: { [defaultConfig.headers.session]: "ses_undo" },
+        body: JSON.stringify({ model: "gpt", input: afterCommittedUndo }),
+      })
+      expect(jsonBody(calls[0]?.init).input).toEqual(afterCommittedUndo)
+    } finally {
+      store.close()
+    }
+  })
+
   test.each([
     ["no compaction", []],
     [

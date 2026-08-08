@@ -136,6 +136,12 @@ export class CheckpointStore {
     this.db.query("delete from checkpoints where session_id = ?").run(sessionID)
   }
 
+  deleteCheckpoint(sessionID: string, providerID: string, responseID: string) {
+    this.db
+      .query("delete from checkpoints where session_id = ? and provider_id = ? and response_id = ?")
+      .run(sessionID, providerID, responseID)
+  }
+
   prune(retentionDays: number) {
     const cutoff = Date.now() - retentionDays * dayMs
     this.db.query("delete from checkpoints where created_at < ?").run(cutoff)

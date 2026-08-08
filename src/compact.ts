@@ -730,6 +730,31 @@ export function createCompactHooks(
       return
     }
 
+    if (event.type === "message.removed") {
+      const properties = asRecord(event.properties)
+      const sessionID = properties?.sessionID
+      const messageID = properties?.messageID
+      if (typeof sessionID !== "string" || typeof messageID !== "string") return
+
+      providerByMessage.delete(messageProviderKey(sessionID, messageID))
+      for (const [providerID, sessions] of checkpointsByProvider) {
+        const checkpoints = sessions.get(sessionID)
+        if (!checkpoints) continue
+
+        const removed = checkpoints.filter((checkpoint) => checkpoint.afterMessageID === messageID)
+        if (!removed.length) continue
+
+        const remaining = checkpoints.filter((checkpoint) => checkpoint.afterMessageID !== messageID)
+        if (remaining.length) sessions.set(sessionID, remaining)
+        else sessions.delete(sessionID)
+
+        const activeCheckpoints = activeCheckpointByProvider.get(providerID)
+        if (activeCheckpoints?.get(sessionID)?.afterMessageID === messageID) activeCheckpoints.delete(sessionID)
+        for (const checkpoint of removed) store.deleteCheckpoint(sessionID, providerID, checkpoint.responseID)
+      }
+      return
+    }
+
     const compact = compactCheckpointFromEvent(event)
     if (!compact) return
     const pending = pendingCompactResults.get(compact.sessionID)
