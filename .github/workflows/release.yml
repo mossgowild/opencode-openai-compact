@@ -79,14 +79,14 @@ jobs:
       - name: Verify published version
         run: |
           VERSION=$(node -p "require('./package.json').version")
+          PACKAGE="opencode-openai-compact@$VERSION"
           for attempt in 1 2 3 4 5; do
-            PUBLISHED=$(npm view "opencode-openai-compact@$VERSION" version --json 2>/dev/null || true)
-            if [ "$PUBLISHED" = "\"$VERSION\"" ]; then
-              echo "Published opencode-openai-compact@$VERSION"
+            if PUBLISHED=$(npm view "$PACKAGE" version 2>&1); then
+              echo "Published $PACKAGE ($PUBLISHED)"
               exit 0
             fi
-            echo "Package not visible yet; retrying ($attempt/5)..."
+            echo "Package not visible yet; retrying ($attempt/5): $PUBLISHED"
             sleep 10
           done
-          echo "Failed to verify opencode-openai-compact@$VERSION on npm"
+          echo "Failed to verify $PACKAGE on npm"
           exit 1
