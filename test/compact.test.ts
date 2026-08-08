@@ -83,6 +83,329 @@ describe("OpenAI compact hooks", () => {
     })
   })
 
+  test("preserves OpenCode compact input with embedded conversation history", () => {
+    const content = [
+      "Create a new anchored summary from the conversation history.",
+      "Output exactly the requested summary structure.",
+      "The following is the conversation history:",
+      "[User]: fix compact request",
+      "[Assistant]: inspecting request",
+    ].join("\n\n")
+
+    const body = compactBody({
+      model: "ignored",
+      instructions: "You are an anchored context summarization assistant for coding sessions.",
+      input: [
+        {
+          role: "developer",
+          content: "You are an anchored context summarization assistant for coding sessions.",
+        },
+        { role: "user", content: [{ type: "input_text", text: content }] },
+      ],
+    })
+
+    expect(body).toEqual({
+      model: defaultCompactModel,
+      input: [{ role: "user", content: [{ type: "input_text", text: content }] }],
+    })
+  })
+
+  test("restores structured compact input from pre-serialization messages", async () => {
+    const store = CheckpointStore.openMemory()
+    const calls: Array<{ url: string; init?: RequestInit }> = []
+    const fakeFetch = (async (requestInput: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(requestInput), init })
+      return new Response(
+        JSON.stringify({
+          id: "resp_structured",
+          created_at: 1,
+          output: [{ type: "compaction_summary", encrypted_content: "compacted" }],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      )
+    }) as typeof fetch
+
+    try {
+      const hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+      const cfg: any = {}
+      await hooks.config?.(cfg)
+      const wrappedFetch = cfg.provider.openai.options.fetch as typeof fetch
+      const sessionID = "ses_structured"
+
+      await hooks["experimental.session.compacting"]?.(
+        { sessionID } as any,
+        { context: [], prompt: undefined },
+      )
+      await hooks["experimental.chat.messages.transform"]?.(
+        {},
+        {
+          messages: [
+            {
+              info: { id: "msg_user", sessionID, role: "user" },
+              parts: [
+                { type: "text", text: "fix compact request" },
+                { type: "file", mime: "image/png", filename: "request.png", url: "data:image/png;base64,AA==" },
+              ],
+            },
+            {
+              info: {
+                id: "msg_assistant",
+                sessionID,
+                role: "assistant",
+                providerID: "openai",
+                modelID: defaultCompactModel,
+              },
+              parts: [
+                {
+                  type: "reasoning",
+                  text: "Inspected the request.",
+                  metadata: {
+                    openai: { itemId: "rs_structured", reasoningEncryptedContent: "encrypted-reasoning" },
+                  },
+                },
+                {
+                  type: "text",
+                  text: "The request loses history.",
+                  metadata: { openai: { itemId: "msg_structured", phase: "final_answer" } },
+                },
+                {
+                  type: "tool",
+                  tool: "read_file",
+                  callID: "call_structured",
+                  state: {
+                    status: "completed",
+                    input: { path: "src/compact.ts" },
+                    output: "file contents",
+                    time: { start: 1, end: 2 },
+                  },
+                },
+              ],
+            },
+          ],
+        } as any,
+      )
+
+      const embedded = [
+        "Create a new anchored summary from the conversation history.",
+        "The following is the conversation history:",
+        "[User]: flattened history that must not be sent",
+      ].join("\n\n")
+      await wrappedFetch("https://proxy.test/openai/v1/responses", {
+        method: "POST",
+        headers: {
+          [defaultConfig.headers.compact]: "1",
+          [defaultConfig.headers.session]: sessionID,
+        },
+        body: JSON.stringify({
+          model: defaultCompactModel,
+          instructions: "You are an anchored context summarization assistant for coding sessions.",
+          input: [{ role: "user", content: [{ type: "input_text", text: embedded }] }],
+        }),
+      })
+
+      expect(calls).toHaveLength(1)
+      expect(calls[0]?.url).toBe("https://proxy.test/openai/v1/responses/compact")
+      expect(jsonBody(calls[0]?.init)).toEqual({
+        model: defaultCompactModel,
+        input: [
+          {
+            role: "user",
+            content: [
+              { type: "input_text", text: "fix compact request" },
+              { type: "input_text", text: "[Attached image/png: request.png]" },
+            ],
+          },
+          {
+            type: "reasoning",
+            id: "rs_structured",
+            encrypted_content: "encrypted-reasoning",
+            summary: [{ type: "summary_text", text: "Inspected the request." }],
+          },
+          {
+            role: "assistant",
+            content: [{ type: "output_text", text: "The request loses history." }],
+            id: "msg_structured",
+            phase: "final_answer",
+          },
+          {
+            type: "function_call",
+            call_id: "call_structured",
+            name: "read_file",
+            arguments: JSON.stringify({ path: "src/compact.ts" }),
+          },
+          { type: "function_call_output", call_id: "call_structured", output: "file contents" },
+        ],
+      })
+    } finally {
+      store.close()
+    }
+  })
+
+  test("orders stable instructions, checkpoint, and restored structured history", async () => {
+    const store = CheckpointStore.openMemory()
+    const calls: Array<{ url: string; init?: RequestInit }> = []
+    const fakeFetch = (async (requestInput: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(requestInput), init })
+      const call = calls.length
+      return new Response(
+        JSON.stringify({
+          id: `resp_${call}`,
+          created_at: call,
+          output: [{ id: `cmp_${call}`, type: "compaction_summary", encrypted_content: `compacted-${call}` }],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      )
+    }) as typeof fetch
+
+    try {
+      const hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+      const cfg: any = {}
+      await hooks.config?.(cfg)
+      const wrappedFetch = cfg.provider.openai.options.fetch as typeof fetch
+      const sessionID = "ses_structured_checkpoint"
+
+      await wrappedFetch("https://proxy.test/openai/v1/responses", {
+        method: "POST",
+        headers: { [defaultConfig.headers.session]: sessionID },
+        body: JSON.stringify({
+          model: "gpt",
+          instructions: "You are OpenCode.",
+          input: [{ role: "developer", content: "Stable developer context." }, { role: "user", content: "hello" }],
+        }),
+      })
+      await wrappedFetch("https://proxy.test/openai/v1/responses", {
+        method: "POST",
+        headers: {
+          [defaultConfig.headers.compact]: "1",
+          [defaultConfig.headers.session]: sessionID,
+        },
+        body: JSON.stringify({
+          model: "ignored",
+          instructions: "You are an anchored context summarization assistant for coding sessions.",
+          input: [
+            {
+              role: "developer",
+              content: "You are an anchored context summarization assistant for coding sessions.",
+            },
+            { role: "user", content: "old history" },
+            { role: "user", content: "Create a new anchored summary from the conversation history." },
+          ],
+        }),
+      })
+
+      await hooks["experimental.session.compacting"]?.(
+        { sessionID } as any,
+        { context: [], prompt: undefined },
+      )
+      await hooks["experimental.chat.messages.transform"]?.(
+        { model: { providerID: "openai" } } as any,
+        {
+          messages: [
+            {
+              info: { id: "msg_tail", sessionID, role: "user" },
+              parts: [{ type: "text", text: "structured tail" }],
+            },
+          ],
+        } as any,
+      )
+
+      const embedded = [
+        "Create a new anchored summary from the conversation history.",
+        "The following is the conversation history:",
+        "[User]: flattened tail",
+      ].join("\n\n")
+      await wrappedFetch("https://proxy.test/openai/v1/responses", {
+        method: "POST",
+        headers: {
+          [defaultConfig.headers.compact]: "1",
+          [defaultConfig.headers.session]: sessionID,
+        },
+        body: JSON.stringify({
+          model: "ignored",
+          instructions: "You are an anchored context summarization assistant for coding sessions.",
+          input: [{ role: "user", content: embedded }],
+        }),
+      })
+
+      expect(jsonBody(calls.at(-1)?.init)).toEqual({
+        model: defaultCompactModel,
+        instructions: "You are OpenCode.",
+        input: [
+          { role: "developer", content: "Stable developer context." },
+          { id: "cmp_2", type: "compaction", encrypted_content: "compacted-2" },
+          { role: "user", content: [{ type: "input_text", text: "structured tail" }] },
+        ],
+      })
+    } finally {
+      store.close()
+    }
+  })
+
+  test("falls back to embedded history when structured messages cannot be cloned", async () => {
+    const store = CheckpointStore.openMemory()
+    const calls: Array<{ url: string; init?: RequestInit }> = []
+    const fakeFetch = (async (requestInput: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(requestInput), init })
+      return new Response(
+        JSON.stringify({
+          id: "resp_fallback",
+          created_at: 1,
+          output: [{ type: "compaction_summary", encrypted_content: "compacted" }],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      )
+    }) as typeof fetch
+
+    try {
+      const hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+      const cfg: any = {}
+      await hooks.config?.(cfg)
+      const wrappedFetch = cfg.provider.openai.options.fetch as typeof fetch
+      const sessionID = "ses_structured_fallback"
+
+      await hooks["experimental.session.compacting"]?.(
+        { sessionID } as any,
+        { context: [], prompt: undefined },
+      )
+      await hooks["experimental.chat.messages.transform"]?.(
+        {},
+        {
+          messages: [
+            {
+              info: { id: "msg_uncloneable", sessionID, role: "user" },
+              parts: [{ type: "text", text: "history", metadata: { uncloneable: () => undefined } }],
+            },
+          ],
+        } as any,
+      )
+
+      const embedded = [
+        "Create a new anchored summary from the conversation history.",
+        "The following is the conversation history:",
+        "[User]: preserved fallback history",
+      ].join("\n\n")
+      await wrappedFetch("https://proxy.test/openai/v1/responses", {
+        method: "POST",
+        headers: {
+          [defaultConfig.headers.compact]: "1",
+          [defaultConfig.headers.session]: sessionID,
+        },
+        body: JSON.stringify({
+          model: "ignored",
+          instructions: "You are an anchored context summarization assistant for coding sessions.",
+          input: [{ role: "user", content: embedded }],
+        }),
+      })
+
+      expect(jsonBody(calls[0]?.init)).toEqual({
+        model: defaultCompactModel,
+        input: [{ role: "user", content: embedded }],
+      })
+    } finally {
+      store.close()
+    }
+  })
+
   test("normalizes exactly one compaction while preserving passthrough fields", () => {
     expect(
       compactedItemsFrom([

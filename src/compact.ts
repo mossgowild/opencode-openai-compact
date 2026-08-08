@@ -15,18 +15,34 @@ export { compactedItemsFrom } from "./state.js"
 
 type FetchLike = typeof fetch
 type MessageEntry = {
-  info?: { id?: string; sessionID?: string; time?: { created?: number } }
+  info?: {
+    id?: string
+    sessionID?: string
+    role?: string
+    providerID?: string
+    modelID?: string
+    error?: unknown
+    time?: { created?: number }
+  }
   parts?: Array<{
     type?: string
     text?: string
     messageID?: string
     synthetic?: boolean
+    ignored?: boolean
+    mime?: string
+    filename?: string
+    url?: string
+    tool?: string
+    callID?: string
+    state?: unknown
     metadata?: AnyRecord
     time?: { start?: number }
   }>
 }
 type MessageBoundary = { messageID: string; createdAt: number }
 type PendingCompactResult = { providerID: string; responseID: string; items: AnyRecord[] }
+type StructuredCompactionSnapshot = { messages?: MessageEntry[] }
 type ProviderConfig = OpenAICompactConfig["providers"][string]
 type StableInstructions = { instructions?: unknown; inputPrefix: unknown[] }
 type CompactHookOptions = {
@@ -44,9 +60,11 @@ const openCodeCompactionUserPromptStarts = [
   "Create a new anchored summary from the conversation history.",
   "Update the anchored summary below using the conversation history above.",
 ] as const
+const openCodeConversationHistoryMarker = "The following is the conversation history:"
 const openCodeCompactionQuestion = "What did we do so far?"
 const openCodeCompactionContinuation =
   "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed."
+const toolOutputMaxChars = 2_000
 
 function asRecord(value: unknown): AnyRecord | undefined {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as AnyRecord) : undefined
@@ -167,11 +185,192 @@ function compactInput(value: unknown) {
     const record = asRecord(item)
     if (!record) return true
     if (record.role === "developer" && isOpenCodeCompactionDeveloperPrompt(record.content)) return false
-    if (index === value.length - 1 && record.role === "user" && isOpenCodeCompactionUserPrompt(record.content)) {
+    if (
+      index === value.length - 1 &&
+      record.role === "user" &&
+      isOpenCodeCompactionUserPrompt(record.content) &&
+      !contentText(record.content).includes(openCodeConversationHistoryMarker)
+    ) {
       return false
     }
     return true
   })
+}
+
+function isEmbeddedOpenCodeCompactionInput(value: unknown) {
+  if (!Array.isArray(value)) return false
+  const last = asRecord(value.at(-1))
+  return (
+    last?.role === "user" &&
+    isOpenCodeCompactionUserPrompt(last.content) &&
+    contentText(last.content).includes(openCodeConversationHistoryMarker)
+  )
+}
+
+function truncateToolOutput(value: string) {
+  if (value.length <= toolOutputMaxChars) return value
+  const omitted = value.length - toolOutputMaxChars
+  return `${value.slice(0, toolOutputMaxChars)}\n[Tool output truncated for compaction: omitted ${omitted} chars]`
+}
+
+function structuredOpenAIInput(
+  messages: MessageEntry[],
+  providerID: string,
+  sourceModel: string,
+): AnyRecord[] | undefined {
+  const input: AnyRecord[] = []
+
+  for (const message of messages) {
+    const info = message.info
+    const parts = message.parts ?? []
+    if (!info?.role || info.error) return undefined
+    if (!parts.length) continue
+
+    if (info.role === "user") {
+      const content: AnyRecord[] = []
+      for (const part of parts) {
+        if (part.type === "text" && !part.ignored && part.text) {
+          content.push({ type: "input_text", text: part.text })
+          continue
+        }
+        if (part.type === "file") {
+          if (typeof part.mime !== "string") return undefined
+          if (part.mime === "text/plain" || part.mime === "application/x-directory") continue
+          if (part.mime.startsWith("image/") || part.mime === "application/pdf") {
+            content.push({ type: "input_text", text: `[Attached ${part.mime}: ${part.filename ?? "file"}]` })
+            continue
+          }
+          if (typeof part.url !== "string") return undefined
+          content.push(
+            part.url.startsWith("data:")
+              ? { type: "input_file", filename: part.filename ?? "file", file_data: part.url }
+              : { type: "input_file", file_url: part.url },
+          )
+          continue
+        }
+        if (part.type === "compaction") {
+          content.push({ type: "input_text", text: openCodeCompactionQuestion })
+          continue
+        }
+        if (part.type === "subtask") {
+          content.push({ type: "input_text", text: "The following tool was executed by the user" })
+        }
+      }
+      if (content.length) input.push({ role: "user", content })
+      continue
+    }
+
+    if (info.role !== "assistant") return undefined
+    const differentModel = `${providerID}/${sourceModel}` !== `${info.providerID}/${info.modelID}`
+    const assistantItems: AnyRecord[] = []
+    const toolOutputs: AnyRecord[] = []
+    const reasoningByID = new Map<string, AnyRecord>()
+    const hasSignedReasoning = parts.some(
+      (part) => part.type === "reasoning" && asRecord(asRecord(part.metadata)?.anthropic)?.signature != null,
+    )
+
+    for (const part of parts) {
+      if (part.type === "text") {
+        const text = part.text === "" && hasSignedReasoning ? " " : part.text
+        if (typeof text !== "string") return undefined
+        const metadata = differentModel ? undefined : asRecord(asRecord(part.metadata)?.openai)
+        const item: AnyRecord = {
+          role: "assistant",
+          content: [{ type: "output_text", text }],
+        }
+        if (typeof metadata?.itemId === "string") item.id = metadata.itemId
+        if (metadata?.phase === "commentary" || metadata?.phase === "final_answer") item.phase = metadata.phase
+        assistantItems.push(item)
+        continue
+      }
+
+      if (part.type === "reasoning") {
+        if (typeof part.text !== "string") return undefined
+        if (differentModel) {
+          if (part.text.trim()) {
+            assistantItems.push({ role: "assistant", content: [{ type: "output_text", text: part.text }] })
+          }
+          continue
+        }
+
+        const metadata = asRecord(asRecord(part.metadata)?.openai)
+        const encryptedContent = metadata?.reasoningEncryptedContent
+        if (typeof encryptedContent !== "string") continue
+        const summary = part.text ? [{ type: "summary_text", text: part.text }] : []
+        const itemID = metadata?.itemId
+        if (typeof itemID !== "string") {
+          assistantItems.push({ type: "reasoning", encrypted_content: encryptedContent, summary })
+          continue
+        }
+
+        const existing = reasoningByID.get(itemID)
+        if (existing) {
+          const existingSummary = existing.summary as AnyRecord[]
+          existingSummary.push(...summary)
+          existing.encrypted_content = encryptedContent
+          continue
+        }
+        const item: AnyRecord = {
+          type: "reasoning",
+          id: itemID,
+          encrypted_content: encryptedContent,
+          summary,
+        }
+        reasoningByID.set(itemID, item)
+        assistantItems.push(item)
+        continue
+      }
+
+      if (part.type !== "tool") continue
+      if (part.metadata?.providerExecuted === true) return undefined
+      if (typeof part.tool !== "string" || typeof part.callID !== "string") return undefined
+      const state = asRecord(part.state)
+      if (!state || typeof state.status !== "string") return undefined
+
+      let argumentsText: string
+      try {
+        argumentsText = JSON.stringify(state.input === undefined ? {} : state.input)
+      } catch {
+        return undefined
+      }
+      assistantItems.push({
+        type: "function_call",
+        call_id: part.callID,
+        name: part.tool,
+        arguments: argumentsText,
+      })
+
+      let output: string
+      if (state.status === "completed") {
+        const time = asRecord(state.time)
+        if (time?.compacted) output = "[Old tool result content cleared]"
+        else if (typeof state.output === "string") output = truncateToolOutput(state.output)
+        else return undefined
+      } else if (state.status === "error") {
+        const metadata = asRecord(state.metadata)
+        if (metadata?.interrupted === true && typeof metadata.output === "string") output = metadata.output
+        else if (typeof state.error === "string") output = state.error
+        else return undefined
+      } else if (state.status === "pending" || state.status === "running") {
+        output = "[Tool execution was interrupted]"
+      } else {
+        return undefined
+      }
+      toolOutputs.push({ type: "function_call_output", call_id: part.callID, output })
+    }
+
+    input.push(...assistantItems, ...toolOutputs)
+  }
+
+  return input.length ? input : undefined
+}
+
+function cloneMessages(messages: MessageEntry[]) {
+  try {
+    return structuredClone(messages)
+  } catch {
+    return undefined
+  }
 }
 
 function messageHasText(value: unknown, role: "assistant" | "user", text: string) {
@@ -450,6 +649,8 @@ export function createCompactHooks(
   const stableInstructionsByProvider = new Map<string, Map<string, StableInstructions>>()
   const pendingSystemByProvider = new Map<string, Map<string, string>>()
   const providerByMessage = new Map<string, string>()
+  const pendingCompactionCaptures = new Map<string, number>()
+  const structuredCompactionSnapshots = new Map<string, StructuredCompactionSnapshot[]>()
   let getOpenAIAuth: (() => Promise<OpenAIOAuthAuth | undefined>) | undefined
   const openAIOAuth = createOpenAIOAuth({
     getAuth: async () => getOpenAIAuth?.(),
@@ -597,6 +798,30 @@ export function createCompactHooks(
     messages.splice(0, messages.length, ...trimmed)
   }
 
+  function takeStructuredSnapshot(sessionID: string) {
+    const snapshots = structuredCompactionSnapshots.get(sessionID)
+    const snapshot = snapshots?.shift()
+    if (!snapshots?.length) structuredCompactionSnapshots.delete(sessionID)
+    return snapshot
+  }
+
+  function structuredInputFor(providerID: string, sessionID: string, sourceModel: string) {
+    const snapshot = takeStructuredSnapshot(sessionID)
+    const messages = snapshot?.messages ? cloneMessages(snapshot.messages) : undefined
+    if (!messages) return undefined
+
+    try {
+      trimMessagesAfterCheckpoint(providerID, messages)
+      const history = structuredOpenAIInput(messages, providerID, sourceModel)
+      if (!history) return undefined
+
+      const checkpoint = activeCheckpointByProvider.get(providerID)?.get(sessionID)
+      return checkpoint ? [...structuredClone(checkpoint.items), ...history] : history
+    } catch {
+      return undefined
+    }
+  }
+
   async function initWithCompactedInput(
     providerID: string,
     requestInput: RequestInfo | URL,
@@ -660,13 +885,26 @@ export function createCompactHooks(
       }
 
       if (!body?.model || !body.input || !url) {
+        takeStructuredSnapshot(sessionID)
         return baseFetch(routedRequestInput, routedRequestInit)
       }
 
       const outboundCompactHeaders = new Headers(routedRequestInit.headers)
       outboundCompactHeaders.set("content-type", "application/json")
+      const shouldRestoreStructure =
+        config.compactBodyKeys.includes("input") && isEmbeddedOpenCodeCompactionInput(body.input)
+      const structuredInput = shouldRestoreStructure
+        ? structuredInputFor(
+            providerID,
+            sessionID,
+            typeof body.model === "string" ? body.model : provider.compactModel,
+          )
+        : undefined
+      if (!shouldRestoreStructure) takeStructuredSnapshot(sessionID)
+      const compactBodyWithHistory = compactBody(body, provider.compactModel, config)
+      if (structuredInput) compactBodyWithHistory.input = structuredInput
       const compactRequestBody = withStableInstructions(
-        compactBody(body, provider.compactModel, config),
+        compactBodyWithHistory,
         stableInstructionsByProvider.get(providerID)?.get(sessionID),
         config.compactBodyKeys.includes("instructions"),
       )
@@ -723,6 +961,8 @@ export function createCompactHooks(
       for (const sessions of activeCheckpointByProvider.values()) sessions.delete(sessionID)
       for (const sessions of stableInstructionsByProvider.values()) sessions.delete(sessionID)
       for (const sessions of pendingSystemByProvider.values()) sessions.delete(sessionID)
+      pendingCompactionCaptures.delete(sessionID)
+      structuredCompactionSnapshots.delete(sessionID)
       for (const key of providerByMessage.keys()) {
         if (key.startsWith(`${sessionID}\0`)) providerByMessage.delete(key)
       }
@@ -737,6 +977,8 @@ export function createCompactHooks(
       if (typeof sessionID !== "string" || typeof messageID !== "string") return
 
       providerByMessage.delete(messageProviderKey(sessionID, messageID))
+      pendingCompactionCaptures.delete(sessionID)
+      structuredCompactionSnapshots.delete(sessionID)
       for (const [providerID, sessions] of checkpointsByProvider) {
         const checkpoints = sessions.get(sessionID)
         if (!checkpoints) continue
@@ -826,9 +1068,18 @@ export function createCompactHooks(
 
     "experimental.chat.messages.transform": async (input, output) => {
       const messages = output.messages as unknown as MessageEntry[]
+      const sessionID = sessionIDFromMessages(messages)
+      const pendingCaptures = sessionID ? pendingCompactionCaptures.get(sessionID) : undefined
+      const snapshot = pendingCaptures ? { messages: cloneMessages(messages) } : undefined
       const providerID = transformProviderID(input, messages)
-      if (!providerID || !configuredProviders.has(providerID)) return
-      trimMessagesAfterCheckpoint(providerID, messages)
+      if (providerID && configuredProviders.has(providerID)) trimMessagesAfterCheckpoint(providerID, messages)
+      if (sessionID && pendingCaptures && snapshot) {
+        if (pendingCaptures === 1) pendingCompactionCaptures.delete(sessionID)
+        else pendingCompactionCaptures.set(sessionID, pendingCaptures - 1)
+        const snapshots = structuredCompactionSnapshots.get(sessionID) ?? []
+        snapshots.push(snapshot)
+        structuredCompactionSnapshots.set(sessionID, snapshots)
+      }
     },
 
     "experimental.chat.system.transform": async (input, output) => {
@@ -836,6 +1087,11 @@ export function createCompactHooks(
       if (!providerID || !configuredProviders.has(providerID)) return
       if (typeof input.sessionID !== "string") return
       rememberPendingSystem(providerID, input.sessionID, output.system)
+    },
+
+    "experimental.session.compacting": async (input) => {
+      if (typeof input.sessionID !== "string") return
+      pendingCompactionCaptures.set(input.sessionID, (pendingCompactionCaptures.get(input.sessionID) ?? 0) + 1)
     },
   }
 
