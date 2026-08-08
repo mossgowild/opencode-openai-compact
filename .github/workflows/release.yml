@@ -55,7 +55,26 @@ jobs:
         run: npm install -g npm@latest
 
       - name: Publish to npm
-        run: npm publish --provenance
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          PACKAGE="opencode-openai-compact@$VERSION"
+
+          if npm view "$PACKAGE" version --json >/dev/null 2>&1; then
+            echo "$PACKAGE is already published; treating publish as successful"
+            exit 0
+          fi
+
+          if npm publish --provenance; then
+            exit 0
+          fi
+
+          if npm view "$PACKAGE" version --json >/dev/null 2>&1; then
+            echo "$PACKAGE was published despite the publish command failure; treating publish as successful"
+            exit 0
+          fi
+
+          echo "Failed to publish $PACKAGE"
+          exit 1
 
       - name: Verify published version
         run: |
