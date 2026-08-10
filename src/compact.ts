@@ -651,10 +651,14 @@ export function createCompactHooks(
   const providerByMessage = new Map<string, string>()
   const pendingCompactionCaptures = new Map<string, number>()
   const structuredCompactionSnapshots = new Map<string, StructuredCompactionSnapshot[]>()
-  let getOpenAIAuth: (() => Promise<OpenAIOAuthAuth | undefined>) | undefined
+  let openAIAuth: OpenAIOAuthAuth | undefined
+  let openAIWrappedFetch: FetchLike | undefined
   const openAIOAuth = createOpenAIOAuth({
-    getAuth: async () => getOpenAIAuth?.(),
-    setAuth: options.setOpenAIAuth,
+    getAuth: async () => openAIAuth,
+    async setAuth(auth) {
+      openAIAuth = auth
+      await options.setOpenAIAuth?.(auth)
+    },
     tokenFetch: options.tokenFetch,
   })
 
@@ -952,6 +956,13 @@ export function createCompactHooks(
     return wrapped
   }
 
+  function getOpenAIWrappedFetch(base: FetchLike = baseFetch) {
+    const provider = config.providers.openai
+    if (!provider) return undefined
+    openAIWrappedFetch ??= wrapFetch(base, "openai", provider)
+    return openAIWrappedFetch
+  }
+
   async function handleEvent(event: AnyRecord) {
     if (event.type === "session.deleted") {
       const sessionID = asRecord(event.properties)?.sessionID
@@ -1011,11 +1022,14 @@ export function createCompactHooks(
       provider: "openai",
       methods: openAIAuthMethods,
       async loader(getAuth) {
-        getOpenAIAuth = async () => asOpenAIOAuth(await getAuth())
         const auth = await getAuth()
+        openAIAuth = asOpenAIOAuth(auth)
         const apiAuth = asRecord(auth)
-        if (asOpenAIOAuth(auth)) return { apiKey: openAIOAuthDummyKey }
-        if (apiAuth?.type === "api" && typeof apiAuth.key === "string") return { apiKey: apiAuth.key }
+        const fetch = getOpenAIWrappedFetch()
+        if (openAIAuth) return { apiKey: openAIOAuthDummyKey, ...(fetch ? { fetch } : {}) }
+        if (apiAuth?.type === "api" && typeof apiAuth.key === "string") {
+          return { apiKey: apiAuth.key, ...(fetch ? { fetch } : {}) }
+        }
         return {}
       },
     },
@@ -1033,7 +1047,11 @@ export function createCompactHooks(
         const provider = providers[providerID] as AnyRecord
         provider.options ??= {}
         const options = provider.options as AnyRecord
-        options.fetch = wrapFetch((options.fetch as FetchLike | undefined) ?? baseFetch, providerID, compactProvider)
+        const currentFetch = (options.fetch as FetchLike | undefined) ?? baseFetch
+        options.fetch =
+          providerID === "openai"
+            ? getOpenAIWrappedFetch(currentFetch)
+            : wrapFetch(currentFetch, providerID, compactProvider)
       }
     },
 

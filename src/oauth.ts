@@ -347,9 +347,9 @@ export function createOpenAIOAuth(options: OpenAIOAuthOptions) {
   }
 
   return {
-    async requestInit(requestInit: RequestInit): Promise<RequestInit | undefined> {
+    async requestInit(requestInit: RequestInit): Promise<RequestInit> {
       const auth = await freshAuth()
-      if (!auth) return undefined
+      if (!auth) throw new Error("OpenAI OAuth credentials are unavailable; refusing to send the OAuth dummy key")
 
       const headers = new Headers(requestInit.headers)
       headers.set("authorization", `Bearer ${auth.access}`)

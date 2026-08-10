@@ -39,10 +39,92 @@ describe("OpenAI OAuth hooks", () => {
         }),
         {} as any,
       )
-      expect(oauthOptions).toEqual({ apiKey: openAIOAuthDummyKey })
+      expect(oauthOptions?.apiKey).toBe(openAIOAuthDummyKey)
+      expect(oauthOptions?.fetch).toBeTypeOf("function")
 
       const apiOptions = await hooks.auth?.loader?.(async () => ({ type: "api", key: "sk-test" }), {} as any)
-      expect(apiOptions).toEqual({ apiKey: "sk-test" })
+      expect(apiOptions?.apiKey).toBe("sk-test")
+      expect(apiOptions?.fetch).toBe(oauthOptions?.fetch)
+    } finally {
+      store.close()
+    }
+  })
+
+  test("keeps the authenticated fetch when provider config is reapplied after auth loaders", async () => {
+    const store = CheckpointStore.openMemory()
+    const calls: Array<{ url: string; init?: RequestInit }> = []
+    const fakeFetch = (async (requestInput: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(requestInput), init })
+      return new Response("ok")
+    }) as typeof fetch
+    let authReads = 0
+
+    try {
+      const hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+      const cfg: any = {}
+      await hooks.config?.(cfg)
+      const configuredFetch = cfg.provider.openai.options.fetch as typeof fetch
+
+      const oauthOptions = await hooks.auth?.loader?.(
+        async () => {
+          authReads++
+          if (authReads > 1) throw new Error("OAuth auth was read after provider initialization")
+          return {
+            type: "oauth",
+            refresh: "refresh-token",
+            access: "real-access-token",
+            expires: Date.now() + 60_000,
+            accountId: "acct_test",
+          }
+        },
+        {} as any,
+      )
+      expect(oauthOptions?.fetch).toBe(configuredFetch)
+
+      const nativeFetch = (async () => new Response("native")) as typeof fetch
+      const providerOptions = {
+        fetch: nativeFetch,
+        ...(oauthOptions ?? {}),
+        ...cfg.provider.openai.options,
+      }
+      expect(providerOptions.fetch).toBe(configuredFetch)
+
+      await providerOptions.fetch("https://api.openai.com/v1/responses", {
+        method: "POST",
+        headers: { authorization: `Bearer ${openAIOAuthDummyKey}` },
+        body: JSON.stringify({ model: "gpt", input: [] }),
+      })
+
+      expect(authReads).toBe(1)
+      expect(calls[0]?.url).toBe("https://chatgpt.com/backend-api/codex/responses")
+      expect(new Headers(calls[0]?.init?.headers).get("authorization")).toBe("Bearer real-access-token")
+    } finally {
+      store.close()
+    }
+  })
+
+  test("never sends the OAuth dummy key when credentials are unavailable", async () => {
+    const store = CheckpointStore.openMemory()
+    const calls: Array<{ url: string; init?: RequestInit }> = []
+    const fakeFetch = (async (requestInput: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(requestInput), init })
+      return new Response("unexpected")
+    }) as typeof fetch
+
+    try {
+      const hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+      const cfg: any = {}
+      await hooks.config?.(cfg)
+      const wrappedFetch = cfg.provider.openai.options.fetch as typeof fetch
+
+      await expect(
+        wrappedFetch("https://api.openai.com/v1/responses", {
+          method: "POST",
+          headers: { authorization: `Bearer ${openAIOAuthDummyKey}` },
+          body: JSON.stringify({ model: "gpt", input: [] }),
+        }),
+      ).rejects.toThrow("OpenAI OAuth credentials are unavailable")
+      expect(calls).toEqual([])
     } finally {
       store.close()
     }
@@ -564,7 +646,7 @@ describe("OpenAI OAuth hooks", () => {
     }
   })
 
-  test("refreshes expired OpenAI OAuth token before routing responses", async () => {
+  test("shares one token refresh across concurrent OpenAI OAuth responses", async () => {
     const store = CheckpointStore.openMemory()
     const calls: Array<{ url: string; init?: RequestInit }> = []
     const tokenCalls: Array<{ url: string; init?: RequestInit }> = []
@@ -602,18 +684,27 @@ describe("OpenAI OAuth hooks", () => {
       await hooks.config?.(cfg)
       const wrappedFetch = cfg.provider.openai.options.fetch as typeof fetch
 
-      await wrappedFetch("https://api.openai.com/v1/responses", {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${openAIOAuthDummyKey}`,
-          [defaultConfig.headers.session]: "ses_oauth",
-        },
-        body: JSON.stringify({ model: "gpt", input: [] }),
-      })
+      await Promise.all(
+        ["ses_oauth_1", "ses_oauth_2"].map((sessionID) =>
+          wrappedFetch("https://api.openai.com/v1/responses", {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${openAIOAuthDummyKey}`,
+              [defaultConfig.headers.session]: sessionID,
+            },
+            body: JSON.stringify({ model: "gpt", input: [] }),
+          }),
+        ),
+      )
 
+      expect(tokenCalls).toHaveLength(1)
       expect(tokenCalls[0]?.url).toBe("https://auth.openai.com/oauth/token")
       expect(String(tokenCalls[0]?.init?.body)).toContain("refresh_token=refresh-token")
-      expect(new Headers(calls[0]?.init?.headers).get("authorization")).toBe("Bearer refreshed-access-token")
+      expect(calls).toHaveLength(2)
+      for (const call of calls) {
+        expect(new Headers(call.init?.headers).get("authorization")).toBe("Bearer refreshed-access-token")
+      }
+      expect(savedAuth).toHaveLength(1)
       expect(savedAuth[0]?.access).toBe("refreshed-access-token")
     } finally {
       store.close()
