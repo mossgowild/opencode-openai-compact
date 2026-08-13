@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@opencode-ai/plugin':
-        specifier: 1.18.7
-        version: 1.18.7
+        specifier: 1.18.16
+        version: 1.18.16
       jsonc-parser:
         specifier: 3.3.1
         version: 3.3.1
@@ -19,14 +19,14 @@ importers:
         version: 4.4.3
     devDependencies:
       '@types/node':
-        specifier: 26.1.2
-        version: 26.1.2
+        specifier: 26.2.0
+        version: 26.2.0
       typescript:
         specifier: 7.0.2
         version: 7.0.2
       vitest:
         specifier: 4.1.10
-        version: 4.1.10(@types/node@26.1.2)(vite@8.0.16(@types/node@26.1.2)(yaml@2.9.0))
+        version: 4.1.10(@types/node@26.2.0)(vite@8.0.16(@types/node@26.2.0)(yaml@2.9.0))
 
 packages:
 
@@ -82,8 +82,8 @@ packages:
       '@emnapi/core': ^1.7.1
       '@emnapi/runtime': ^1.7.1
 
-  '@opencode-ai/plugin@1.18.7':
-    resolution: {integrity: sha512-kXm5hqur5JiF/xJPaQYkuNn7vSl4ya09YgL/pIvIrggWCLFsfo1gXqNbONRcGW7m5Ih2k6kgMXFyjB9or1+dEg==}
+  '@opencode-ai/plugin@1.18.16':
+    resolution: {integrity: sha512-XvlZ9CFAXqrNrmpTe+EhhRYnDhca6db1ebcB10v5JO8kSm1iFbVbPP982Qzc4MRSrfpPjD8W1fg13Ubnff377g==}
     peerDependencies:
       '@opentui/core': '>=0.4.5'
       '@opentui/keymap': '>=0.4.5'
@@ -96,8 +96,8 @@ packages:
       '@opentui/solid':
         optional: true
 
-  '@opencode-ai/sdk@1.18.7':
-    resolution: {integrity: sha512-5txVELvCxzC3O/MYnRKdTvBN3TqQjE3PaEks3kDRA/moWzMSUhdm15xCth/Mz/NPYyGTn2u4IdScdV9vLTfLRg==}
+  '@opencode-ai/sdk@1.18.16':
+    resolution: {integrity: sha512-UvaHyL93spLm7MttoprWTOBSYQN3aYWd7/3Ie5WNnG2pRAPq/U/d51qt0smYBTrkjxqlQmg+AJoGw8MEH6lGUg==}
 
   '@oxc-project/types@0.133.0':
     resolution: {integrity: sha512-KzkdCd6Uxqnf6l3HOw1xfatAlUURA0g14cvBYFyJ5SaNOQbOUvBr9PKArcPcrNIeRsBdgcUzOGrhKveVpvOIGA==}
@@ -215,8 +215,8 @@ packages:
   '@types/estree@1.0.9':
     resolution: {integrity: sha512-GhdPgy1el4/ImP05X05Uw4cw2/M93BCUmnEvWZNStlCzEKME4Fkk+YpoA5OiHNQmoS7Cafb8Xa3Pya8m1Qrzeg==}
 
-  '@types/node@26.1.2':
-    resolution: {integrity: sha512-Vu4a5UFA9rIIFJ7rB/Vaafh9lrCQszopTCx6KjFboXTGQbPNasehVR5TEiithSDGyd1DEiUByggTZsg8jukeIg==}
+  '@types/node@26.2.0':
+    resolution: {integrity: sha512-5IviulTZeRNp2vAJ514cc/HUlY5nZ9fCbq9DMyC52BrhFZACo3nI0R7qBxhQmo/d27NFe96ur/b7Wwxklda+kg==}
 
   '@typescript/typescript-aix-ppc64@7.0.2':
     resolution: {integrity: sha512-MTKKkWB7p/0E9xi1d1tHtZ5PiLkGEMIq88pK2CubZjOsLtYTLqhgIgi6zepFa+9GHZ6h05NMCkQxGKiPXMxXtQ==}
@@ -771,14 +771,14 @@ snapshots:
       '@tybys/wasm-util': 0.10.3
     optional: true
 
-  '@opencode-ai/plugin@1.18.7':
+  '@opencode-ai/plugin@1.18.16':
     dependencies:
       '@ai-sdk/provider': 3.0.8
-      '@opencode-ai/sdk': 1.18.7
+      '@opencode-ai/sdk': 1.18.16
       effect: 4.0.0-beta.83
       zod: 4.1.8
 
-  '@opencode-ai/sdk@1.18.7':
+  '@opencode-ai/sdk@1.18.16':
     dependencies:
       cross-spawn: 7.0.6
 
@@ -851,7 +851,7 @@ snapshots:
 
   '@types/estree@1.0.9': {}
 
-  '@types/node@26.1.2':
+  '@types/node@26.2.0':
     dependencies:
       undici-types: 8.3.0
 
@@ -924,13 +924,13 @@ snapshots:
       chai: 6.2.2
       tinyrainbow: 3.1.0
 
-  '@vitest/mocker@4.1.10(vite@8.0.16(@types/node@26.1.2)(yaml@2.9.0))':
+  '@vitest/mocker@4.1.10(vite@8.0.16(@types/node@26.2.0)(yaml@2.9.0))':
     dependencies:
       '@vitest/spy': 4.1.10
       estree-walker: 3.0.3
       magic-string: 0.30.21
     optionalDependencies:
-      vite: 8.0.16(@types/node@26.1.2)(yaml@2.9.0)
+      vite: 8.0.16(@types/node@26.2.0)(yaml@2.9.0)
 
   '@vitest/pretty-format@4.1.10':
     dependencies:
@@ -1188,7 +1188,7 @@ snapshots:
 
   uuid@14.0.1: {}
 
-  vite@8.0.16(@types/node@26.1.2)(yaml@2.9.0):
+  vite@8.0.16(@types/node@26.2.0)(yaml@2.9.0):
     dependencies:
       lightningcss: 1.33.0
       picomatch: 4.0.5
@@ -1196,14 +1196,14 @@ snapshots:
       rolldown: 1.0.3
       tinyglobby: 0.2.17
     optionalDependencies:
-      '@types/node': 26.1.2
+      '@types/node': 26.2.0
       fsevents: 2.3.3
       yaml: 2.9.0
 
-  vitest@4.1.10(@types/node@26.1.2)(vite@8.0.16(@types/node@26.1.2)(yaml@2.9.0)):
+  vitest@4.1.10(@types/node@26.2.0)(vite@8.0.16(@types/node@26.2.0)(yaml@2.9.0)):
     dependencies:
       '@vitest/expect': 4.1.10
-      '@vitest/mocker': 4.1.10(vite@8.0.16(@types/node@26.1.2)(yaml@2.9.0))
+      '@vitest/mocker': 4.1.10(vite@8.0.16(@types/node@26.2.0)(yaml@2.9.0))
       '@vitest/pretty-format': 4.1.10
       '@vitest/runner': 4.1.10
       '@vitest/snapshot': 4.1.10
@@ -1220,10 +1220,10 @@ snapshots:
       tinyexec: 1.2.4
       tinyglobby: 0.2.17
       tinyrainbow: 3.1.0
-      vite: 8.0.16(@types/node@26.1.2)(yaml@2.9.0)
+      vite: 8.0.16(@types/node@26.2.0)(yaml@2.9.0)
       why-is-node-running: 2.3.0
     optionalDependencies:
-      '@types/node': 26.1.2
+      '@types/node': 26.2.0
     transitivePeerDependencies:
       - msw
 
