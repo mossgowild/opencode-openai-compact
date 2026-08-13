@@ -1,10 +1,21 @@
 import { describe, expect, test } from "vitest"
-import { compactBody, compactedItemsFrom, compactUrl, createCompactHooks } from "../src/compact.js"
+import { compactBody, compactedItemsFrom, createCompactHooks } from "../src/compact.js"
 import { defaultConfig, OpenAICompactConfigSchema } from "../src/schema.js"
 import { CheckpointStore } from "../src/state.js"
 
 function jsonBody(init: RequestInit | undefined) {
   return JSON.parse(typeof init?.body === "string" ? init.body : "{}")
+}
+
+function compactResponse(payload: any) {
+  const events = [
+    ...(payload.output ?? []).map((item: any) => ({ type: "response.output_item.done", item })),
+    { type: "response.completed", response: { ...payload, output: undefined } },
+  ]
+  return new Response(`${events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`, {
+    status: 200,
+    headers: { "content-type": "text/event-stream" },
+  })
 }
 
 const defaultCompactModel = defaultConfig.providers.openai.compactModel
@@ -24,16 +35,27 @@ describe("OpenAI compact hooks", () => {
     }
   })
 
-  test("builds compact URL and compact request body", () => {
-    expect(compactUrl(new URL("https://api.openai.com/v1/responses?x=1"))).toBe(
-      "https://api.openai.com/v1/responses/compact?x=1",
-    )
-    expect(compactUrl(new URL("https://proxy.test/openai/v1/responses"))).toBe(
-      "https://proxy.test/openai/v1/responses/compact",
-    )
+  test("builds compaction v2 request body", () => {
+    const body = compactBody({
+      model: "ignored",
+      input: [{ type: "compaction_trigger" }, { role: "user", content: "hello" }],
+      stream: false,
+      tools: [],
+    })
+    expect(body).toEqual({
+      model: defaultCompactModel,
+      input: [{ role: "user", content: "hello" }, { type: "compaction_trigger" }],
+      tools: [],
+      tool_choice: "auto",
+      store: false,
+      stream: true,
+      include: ["reasoning.encrypted_content"],
+    })
 
-    const body = compactBody({ model: "ignored", input: [], stream: true, tools: [] })
-    expect(body).toEqual({ model: defaultCompactModel, input: [], tools: [] })
+    const withoutConfiguredInput = OpenAICompactConfigSchema.parse({ compactBodyKeys: [] })
+    expect(compactBody({ input: [] }, defaultCompactModel, withoutConfiguredInput).input).toEqual([
+      { type: "compaction_trigger" },
+    ])
   })
 
   test("builds standard compact input without OpenCode summarizer prompts", () => {
@@ -73,6 +95,7 @@ describe("OpenAI compact hooks", () => {
         { role: "user", content: "Create a new anchored summary from the conversation history. This is quoted." },
         { role: "assistant", content: [{ type: "output_text", text: "quoted response" }] },
         { role: "user", content: "real request" },
+        { type: "compaction_trigger" },
       ],
       tools: [{ type: "function", name: "test" }],
       parallel_tool_calls: true,
@@ -80,6 +103,10 @@ describe("OpenAI compact hooks", () => {
       service_tier: "priority",
       prompt_cache_key: "cache-key",
       text: { verbosity: "low" },
+      tool_choice: "auto",
+      store: false,
+      stream: true,
+      include: ["reasoning.encrypted_content"],
     })
   })
 
@@ -106,7 +133,14 @@ describe("OpenAI compact hooks", () => {
 
     expect(body).toEqual({
       model: defaultCompactModel,
-      input: [{ role: "user", content: [{ type: "input_text", text: content }] }],
+      input: [
+        { role: "user", content: [{ type: "input_text", text: content }] },
+        { type: "compaction_trigger" },
+      ],
+      tool_choice: "auto",
+      store: false,
+      stream: true,
+      include: ["reasoning.encrypted_content"],
     })
   })
 
@@ -115,14 +149,11 @@ describe("OpenAI compact hooks", () => {
     const calls: Array<{ url: string; init?: RequestInit }> = []
     const fakeFetch = (async (requestInput: RequestInfo | URL, init?: RequestInit) => {
       calls.push({ url: String(requestInput), init })
-      return new Response(
-        JSON.stringify({
-          id: "resp_structured",
-          created_at: 1,
-          output: [{ type: "compaction_summary", encrypted_content: "compacted" }],
-        }),
-        { status: 200, headers: { "content-type": "application/json" } },
-      )
+      return compactResponse({
+        id: "resp_structured",
+        created_at: 1,
+        output: [{ type: "compaction", encrypted_content: "compacted" }],
+      })
     }) as typeof fetch
 
     try {
@@ -204,7 +235,7 @@ describe("OpenAI compact hooks", () => {
       })
 
       expect(calls).toHaveLength(1)
-      expect(calls[0]?.url).toBe("https://proxy.test/openai/v1/responses/compact")
+      expect(calls[0]?.url).toBe("https://proxy.test/openai/v1/responses")
       expect(jsonBody(calls[0]?.init)).toEqual({
         model: defaultCompactModel,
         input: [
@@ -234,7 +265,12 @@ describe("OpenAI compact hooks", () => {
             arguments: JSON.stringify({ path: "src/compact.ts" }),
           },
           { type: "function_call_output", call_id: "call_structured", output: "file contents" },
+          { type: "compaction_trigger" },
         ],
+        tool_choice: "auto",
+        store: false,
+        stream: true,
+        include: ["reasoning.encrypted_content"],
       })
     } finally {
       store.close()
@@ -247,14 +283,11 @@ describe("OpenAI compact hooks", () => {
     const fakeFetch = (async (requestInput: RequestInfo | URL, init?: RequestInit) => {
       calls.push({ url: String(requestInput), init })
       const call = calls.length
-      return new Response(
-        JSON.stringify({
-          id: `resp_${call}`,
-          created_at: call,
-          output: [{ id: `cmp_${call}`, type: "compaction_summary", encrypted_content: `compacted-${call}` }],
-        }),
-        { status: 200, headers: { "content-type": "application/json" } },
-      )
+      return compactResponse({
+        id: `resp_${call}`,
+        created_at: call,
+        output: [{ id: `cmp_${call}`, type: "compaction", encrypted_content: `compacted-${call}` }],
+      })
     }) as typeof fetch
 
     try {
@@ -332,9 +365,15 @@ describe("OpenAI compact hooks", () => {
         instructions: "You are OpenCode.",
         input: [
           { role: "developer", content: "Stable developer context." },
+          { role: "user", content: "old history" },
           { id: "cmp_2", type: "compaction", encrypted_content: "compacted-2" },
           { role: "user", content: [{ type: "input_text", text: "structured tail" }] },
+          { type: "compaction_trigger" },
         ],
+        tool_choice: "auto",
+        store: false,
+        stream: true,
+        include: ["reasoning.encrypted_content"],
       })
     } finally {
       store.close()
@@ -346,14 +385,11 @@ describe("OpenAI compact hooks", () => {
     const calls: Array<{ url: string; init?: RequestInit }> = []
     const fakeFetch = (async (requestInput: RequestInfo | URL, init?: RequestInit) => {
       calls.push({ url: String(requestInput), init })
-      return new Response(
-        JSON.stringify({
-          id: "resp_fallback",
-          created_at: 1,
-          output: [{ type: "compaction_summary", encrypted_content: "compacted" }],
-        }),
-        { status: 200, headers: { "content-type": "application/json" } },
-      )
+      return compactResponse({
+        id: "resp_fallback",
+        created_at: 1,
+        output: [{ type: "compaction", encrypted_content: "compacted" }],
+      })
     }) as typeof fetch
 
     try {
@@ -399,7 +435,11 @@ describe("OpenAI compact hooks", () => {
 
       expect(jsonBody(calls[0]?.init)).toEqual({
         model: defaultCompactModel,
-        input: [{ role: "user", content: embedded }],
+        input: [{ role: "user", content: embedded }, { type: "compaction_trigger" }],
+        tool_choice: "auto",
+        store: false,
+        stream: true,
+        include: ["reasoning.encrypted_content"],
       })
     } finally {
       store.close()
@@ -444,14 +484,11 @@ describe("OpenAI compact hooks", () => {
     const calls: Array<{ url: string; init?: RequestInit }> = []
     const fakeFetch = (async (requestInput: RequestInfo | URL, init?: RequestInit) => {
       calls.push({ url: String(requestInput), init })
-      return new Response(
-        JSON.stringify({
-          id: "resp_compacted",
-          created_at: 1,
-          output: [{ type: "compaction_summary", encrypted_content: "compacted" }],
-        }),
-        { status: 200, headers: { "content-type": "application/json" } },
-      )
+      return compactResponse({
+        id: "resp_compacted",
+        created_at: 1,
+        output: [{ type: "compaction", encrypted_content: "compacted" }],
+      })
     }) as typeof fetch
 
     try {
@@ -501,7 +538,7 @@ describe("OpenAI compact hooks", () => {
         }),
       })
 
-      expect(calls[0]?.url).toBe("https://proxy.test/openai/v1/responses/compact")
+      expect(calls[0]?.url).toBe("https://proxy.test/openai/v1/responses")
       expect(jsonBody(calls[0]?.init)).toEqual({
         model: defaultCompactModel,
         instructions: "You are OpenCode.",
@@ -509,7 +546,12 @@ describe("OpenAI compact hooks", () => {
           { role: "developer", content: "stable instructions" },
           { role: "user", content: "hello" },
           { role: "assistant", content: [{ type: "output_text", text: "done" }] },
+          { type: "compaction_trigger" },
         ],
+        tool_choice: "auto",
+        store: false,
+        stream: true,
+        include: ["reasoning.encrypted_content"],
       })
     } finally {
       store.close()
@@ -521,14 +563,11 @@ describe("OpenAI compact hooks", () => {
     const calls: Array<{ url: string; init?: RequestInit }> = []
     const fakeFetch = (async (requestInput: RequestInfo | URL, init?: RequestInit) => {
       calls.push({ url: String(requestInput), init })
-      return new Response(
-        JSON.stringify({
-          id: "resp_compacted",
-          created_at: 1,
-          output: [{ type: "compaction_summary", encrypted_content: "compacted" }],
-        }),
-        { status: 200, headers: { "content-type": "application/json" } },
-      )
+      return compactResponse({
+        id: "resp_compacted",
+        created_at: 1,
+        output: [{ type: "compaction", encrypted_content: "compacted" }],
+      })
     }) as typeof fetch
 
     try {
@@ -600,14 +639,19 @@ describe("OpenAI compact hooks", () => {
         }),
       })
 
-      expect(calls[0]?.url).toBe("https://proxy.test/openai/v1/responses/compact")
+      expect(calls[0]?.url).toBe("https://proxy.test/openai/v1/responses")
       expect(jsonBody(calls[0]?.init)).toEqual({
         model: defaultCompactModel,
         instructions: "You are OpenCode.\n \nAGENTS instructions",
         input: [
           { role: "user", content: "hello" },
           { role: "assistant", content: [{ type: "output_text", text: "done" }] },
+          { type: "compaction_trigger" },
         ],
+        tool_choice: "auto",
+        store: false,
+        stream: true,
+        include: ["reasoning.encrypted_content"],
       })
     } finally {
       store.close()
@@ -620,14 +664,11 @@ describe("OpenAI compact hooks", () => {
     const calls: Array<{ url: string; init?: RequestInit }> = []
     const fakeFetch = (async (requestInput: RequestInfo | URL, init?: RequestInit) => {
       calls.push({ url: String(requestInput), init })
-      return new Response(
-        JSON.stringify({
-          id: "resp_compacted",
-          created_at: 1,
-          output: [{ type: "compaction_summary", encrypted_content: "compacted" }],
-        }),
-        { status: 200, headers: { "content-type": "application/json" } },
-      )
+      return compactResponse({
+        id: "resp_compacted",
+        created_at: 1,
+        output: [{ type: "compaction", encrypted_content: "compacted" }],
+      })
     }) as typeof fetch
 
     try {
@@ -666,7 +707,15 @@ describe("OpenAI compact hooks", () => {
 
       expect(jsonBody(calls[0]?.init)).toEqual({
         model: defaultCompactModel,
-        input: [{ role: "developer", content: "stable instructions" }, { role: "user", content: "hello" }],
+        input: [
+          { role: "developer", content: "stable instructions" },
+          { role: "user", content: "hello" },
+          { type: "compaction_trigger" },
+        ],
+        tool_choice: "auto",
+        store: false,
+        stream: true,
+        include: ["reasoning.encrypted_content"],
       })
     } finally {
       store.close()
@@ -684,14 +733,11 @@ describe("OpenAI compact hooks", () => {
     const calls: Array<{ url: string; init?: RequestInit }> = []
     const fakeFetch = (async (requestInput: RequestInfo | URL, init?: RequestInit) => {
       calls.push({ url: String(requestInput), init })
-      return new Response(
-        JSON.stringify({
-          id: "resp_compacted",
-          created_at: 1,
-          output: [{ type: "compaction_summary", encrypted_content: "compacted" }],
-        }),
-        { status: 200, headers: { "content-type": "application/json" } },
-      )
+      return compactResponse({
+        id: "resp_compacted",
+        created_at: 1,
+        output: [{ type: "compaction", encrypted_content: "compacted" }],
+      })
     }) as typeof fetch
 
     try {
@@ -711,6 +757,7 @@ describe("OpenAI compact hooks", () => {
       expect(typeof cfg.provider.openai.options.fetch).toBe("function")
       expect(typeof cfg.provider["custom-openai"].options.fetch).toBe("function")
       expect(jsonBody(calls[0]?.init).model).toBe("custom-compact")
+      expect(jsonBody(calls[0]?.init).input.at(-1)).toEqual({ type: "compaction_trigger" })
     } finally {
       store.close()
     }
@@ -721,25 +768,19 @@ describe("OpenAI compact hooks", () => {
     const calls: Array<{ url: string; init?: RequestInit }> = []
     const fakeFetch = (async (requestInput: RequestInfo | URL, init?: RequestInit) => {
       calls.push({ url: String(requestInput), init })
-      return new Response(
-        JSON.stringify({
-          id: "resp_compacted",
-          model: defaultCompactModel,
-          created_at: 1,
-          output: [
-            { type: "message", role: "developer", content: "stale developer context" },
-            { type: "message", role: "system", content: "stale system context" },
-            { type: "message", role: "user", content: "retained user" },
-            {
-              id: "cmp_compacted",
-              type: "compaction_summary",
-              encrypted_content: "compacted",
-              internal_chat_message_metadata_passthrough: { turn_id: "turn_compacted" },
-            },
-          ],
-        }),
-        { status: 200, headers: { "content-type": "application/json" } },
-      )
+      return compactResponse({
+        id: "resp_compacted",
+        model: defaultCompactModel,
+        created_at: 1,
+        output: [
+          {
+            id: "cmp_compacted",
+            type: "compaction",
+            encrypted_content: "compacted",
+            internal_chat_message_metadata_passthrough: { turn_id: "turn_compacted" },
+          },
+        ],
+      })
     }) as typeof fetch
 
     try {
@@ -757,10 +798,14 @@ describe("OpenAI compact hooks", () => {
         body: JSON.stringify({ model: "ignored", input: [{ role: "user", content: "hello" }], stream: true }),
       })
 
-      expect(calls[0]?.url).toBe("https://proxy.test/openai/v1/responses/compact")
+      expect(calls[0]?.url).toBe("https://proxy.test/openai/v1/responses")
       expect(jsonBody(calls[0]?.init)).toEqual({
         model: defaultCompactModel,
-        input: [{ role: "user", content: "hello" }],
+        input: [{ role: "user", content: "hello" }, { type: "compaction_trigger" }],
+        tool_choice: "auto",
+        store: false,
+        stream: true,
+        include: ["reasoning.encrypted_content"],
       })
       expect(new Headers(calls[0]?.init?.headers).has(defaultConfig.headers.compact)).toBe(false)
       expect(new Headers(calls[0]?.init?.headers).has(defaultConfig.headers.session)).toBe(false)
@@ -803,7 +848,7 @@ describe("OpenAI compact hooks", () => {
       const followupBody = jsonBody(calls[0]?.init)
       expect(calls[0]?.url).toBe("https://proxy.test/openai/v1/responses")
       expect(followupBody.input).toEqual([
-        { type: "message", role: "user", content: "retained user" },
+        { role: "user", content: "hello" },
         {
           id: "cmp_compacted",
           type: "compaction",
@@ -871,7 +916,7 @@ describe("OpenAI compact hooks", () => {
       expect(jsonBody(calls[0]?.init).input).toEqual([
         { role: "developer", content: "stable instructions" },
         { role: "system", content: "more stable instructions" },
-        { type: "message", role: "user", content: "retained user" },
+        { role: "user", content: "hello" },
         {
           id: "cmp_compacted",
           type: "compaction",
@@ -879,6 +924,7 @@ describe("OpenAI compact hooks", () => {
           internal_chat_message_metadata_passthrough: { turn_id: "turn_compacted" },
         },
         { role: "user", content: "after compact" },
+        { type: "compaction_trigger" },
       ])
     } finally {
       store.close()
@@ -890,15 +936,12 @@ describe("OpenAI compact hooks", () => {
     const calls: Array<{ url: string; init?: RequestInit }> = []
     const fakeFetch = (async (requestInput: RequestInfo | URL, init?: RequestInit) => {
       calls.push({ url: String(requestInput), init })
-      return new Response(
-        JSON.stringify({
-          id: "resp_undo",
-          model: defaultCompactModel,
-          created_at: 1,
-          output: [{ type: "compaction_summary", encrypted_content: "undo-compacted" }],
-        }),
-        { status: 200, headers: { "content-type": "application/json" } },
-      )
+      return compactResponse({
+        id: "resp_undo",
+        model: defaultCompactModel,
+        created_at: 1,
+        output: [{ type: "compaction", encrypted_content: "undo-compacted" }],
+      })
     }) as typeof fetch
 
     try {
@@ -946,6 +989,7 @@ describe("OpenAI compact hooks", () => {
         body: JSON.stringify({ model: "gpt", input: [{ role: "user", content: "after redo" }] }),
       })
       expect(jsonBody(calls[0]?.init).input).toEqual([
+        { role: "user", content: "before compact" },
         { type: "compaction", encrypted_content: "undo-compacted" },
         { role: "user", content: "after redo" },
       ])
@@ -978,20 +1022,17 @@ describe("OpenAI compact hooks", () => {
 
   test.each([
     ["no compaction", []],
+    ["a legacy compaction summary", [{ type: "compaction_summary", encrypted_content: "legacy" }]],
     [
       "multiple compactions",
       [
         { type: "compaction", encrypted_content: "first" },
-        { type: "compaction_summary", encrypted_content: "second" },
+        { type: "compaction", encrypted_content: "second" },
       ],
     ],
   ])("rejects compact output with %s", async (_name, output) => {
     const store = CheckpointStore.openMemory()
-    const fakeFetch = (async () =>
-      new Response(JSON.stringify({ id: "resp_invalid", output }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      })) as typeof fetch
+    const fakeFetch = (async () => compactResponse({ id: "resp_invalid", output })) as typeof fetch
 
     try {
       const hooks = createCompactHooks(defaultConfig, store, fakeFetch)
@@ -1011,6 +1052,77 @@ describe("OpenAI compact hooks", () => {
       expect(response.status).toBe(502)
       expect(await response.text()).toContain("exactly one valid compaction item")
       expect(store.count()).toBe(0)
+    } finally {
+      store.close()
+    }
+  })
+
+  test.each([
+    ["a missing completed event", `data: ${JSON.stringify({ type: "response.output_item.done", item: { type: "compaction", encrypted_content: "encrypted" } })}\n\n`],
+    [
+      "a completed event without an id",
+      `${[
+        { type: "response.output_item.done", item: { type: "compaction", encrypted_content: "encrypted" } },
+        { type: "response.completed", response: {} },
+      ]
+        .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+        .join("")}data: [DONE]\n\n`,
+    ],
+    [
+      "a failed event",
+      `data: ${JSON.stringify({ type: "response.failed", response: { id: "resp_failed" } })}\n\ndata: [DONE]\n\n`,
+    ],
+  ])("rejects compaction v2 stream with %s", async (_name, stream) => {
+    const store = CheckpointStore.openMemory()
+    const fakeFetch = (async () =>
+      new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } })) as typeof fetch
+
+    try {
+      const hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+      const cfg: any = {}
+      await hooks.config?.(cfg)
+      const response = await cfg.provider.openai.options.fetch("https://api.openai.com/v1/responses", {
+        method: "POST",
+        headers: {
+          [defaultConfig.headers.compact]: "1",
+          [defaultConfig.headers.session]: "ses_invalid_stream",
+        },
+        body: JSON.stringify({ model: "ignored", input: [{ role: "user", content: "hello" }] }),
+      })
+
+      expect(response.status).toBe(502)
+      expect(store.count()).toBe(0)
+    } finally {
+      store.close()
+    }
+  })
+
+  test("ignores deprecated compactEndpointPath", async () => {
+    const config = OpenAICompactConfigSchema.parse({
+      responses: { endpointPath: "/responses", compactEndpointPath: "/removed/compact" },
+    })
+    const store = CheckpointStore.openMemory()
+    const calls: string[] = []
+    const fakeFetch = (async (input: RequestInfo | URL) => {
+      calls.push(String(input))
+      return compactResponse({
+        id: "resp_deprecated_path",
+        output: [{ type: "compaction", encrypted_content: "encrypted" }],
+      })
+    }) as typeof fetch
+
+    try {
+      const hooks = createCompactHooks(config, store, fakeFetch)
+      const cfg: any = {}
+      await hooks.config?.(cfg)
+      await cfg.provider.openai.options.fetch("https://proxy.test/v1/responses", {
+        method: "POST",
+        headers: { [config.headers.compact]: "1", [config.headers.session]: "ses_deprecated_path" },
+        body: JSON.stringify({ model: "ignored", input: [{ role: "user", content: "hello" }] }),
+      })
+
+      expect(calls).toEqual(["https://proxy.test/v1/responses"])
+      expect(store.count()).toBe(1)
     } finally {
       store.close()
     }

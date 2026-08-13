@@ -4,9 +4,9 @@
 [![GitHub stars](https://img.shields.io/github/stars/partment/opencode-openai-compact?style=flat-square)](https://github.com/partment/opencode-openai-compact/stargazers)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 
-Use OpenAI's official Responses API `/responses/compact` in OpenCode.
+Use OpenAI's official Responses API compaction v2 in OpenCode.
 
-OpenCode can compact long coding sessions. When you are using OpenAI Responses models, this plugin routes compaction through OpenAI's native compact endpoint instead of asking another model to write a text summary.
+OpenCode can compact long coding sessions. When you are using OpenAI Responses models, this plugin sends a normal `/responses` request whose final input item is `compaction_trigger`, instead of asking another model to write a text summary.
 
 ![Hero image introducing this plugin.](/assets/images/hero.webp)
 
@@ -16,15 +16,15 @@ OpenCode can compact long coding sessions. When you are using OpenAI Responses m
 | --- | --- |
 | Generates a plain text summary | Returns an encrypted `compaction` item |
 | Can miss tool or reasoning state | Built for the Responses API state model |
-| App-owned summary format | Official `/responses/compact` output |
+| App-owned summary format | Official Responses compaction output |
 | You decide what to keep | OpenAI returns the next compacted window |
 
-The important part is simple: `/responses/compact` returns compacted output that should be passed to the next `/responses` request as-is. This plugin makes OpenCode do that for OpenAI providers.
+The important part is simple: compaction v2 returns an encrypted `compaction` item that should be passed to the next `/responses` request. This plugin makes OpenCode do that for OpenAI providers.
 
 ## What It Does
 
 1. Intercepts OpenCode session compaction for configured OpenAI providers.
-2. Sends the current Responses input window to `/responses/compact`.
+2. Sends the current Responses input window to `/responses` with a final `compaction_trigger` item.
 3. Removes OpenCode's internal summary prompt from the compact request body.
 4. Stores the compacted output in a local SQLite checkpoint.
 5. Injects that checkpoint into the next `/responses` request for the same session.
@@ -117,8 +117,7 @@ The default retention is 30 days. Checkpoints are deleted when OpenCode emits `s
     "session": "x-opencode-openai-responses-compact-session"
   },
   "responses": {
-    "endpointPath": "/responses",
-    "compactEndpointPath": "/responses/compact"
+    "endpointPath": "/responses"
   },
   "compactBodyKeys": [
     "input",
@@ -161,14 +160,14 @@ The default retention is 30 days. Checkpoints are deleted when OpenCode emits `s
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `providers.<id>.compactModel` | `string` | Model sent to `/responses/compact` for this provider. |
+| `providers.<id>.compactModel` | `string` | Model sent to the `/responses` compaction v2 request for this provider. |
 
 ### `responses`
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `endpointPath` | `string` | `"/responses"` | Responses API path suffix to intercept. |
-| `compactEndpointPath` | `string` | `"/responses/compact"` | Compact endpoint path used for compaction calls. |
+| `compactEndpointPath` | `string` | `"/responses/compact"` | Deprecated and ignored. Retained only so existing configuration files continue to load. |
 
 ### `state`
 

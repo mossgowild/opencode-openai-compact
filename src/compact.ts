@@ -53,7 +53,6 @@ type CompactHookOptions = {
 const wrappedFetch = "__opencodeOpenAICompactFetch"
 const wrappedBaseFetch = "__opencodeOpenAICompactBaseFetch"
 const chatGPTCodexResponsesEndpoint = "https://chatgpt.com/backend-api/codex/responses"
-const chatGPTCodexCompactEndpoint = "https://chatgpt.com/backend-api/codex/responses/compact"
 const openCodeCompactionDeveloperPrompt = "You are an anchored context summarization assistant for coding sessions."
 const utilityAgents = new Set(["compaction", "title", "summary"])
 const openCodeCompactionUserPromptStarts = [
@@ -90,14 +89,6 @@ function pathWithoutTrailingSlash(value: string) {
 
 export function isResponsesUrl(url: URL, config: OpenAICompactConfig) {
   return pathWithoutTrailingSlash(url.pathname).endsWith(config.responses.endpointPath)
-}
-
-export function compactUrl(url: URL, config: OpenAICompactConfig = defaultConfig): string {
-  const next = new URL(url.href)
-  const path = pathWithoutTrailingSlash(next.pathname)
-  const prefix = path.slice(0, path.length - config.responses.endpointPath.length)
-  next.pathname = `${prefix}${config.responses.compactEndpointPath}`
-  return next.href
 }
 
 function requestHeaders(input: RequestInfo | URL, init?: RequestInit): Headers {
@@ -392,7 +383,14 @@ function postCompactionInput(input: unknown[], summary: string) {
 }
 
 function compactBodyValue(key: string, value: unknown) {
-  if (key === "input") return compactInput(value)
+  if (key === "input") {
+    const input = compactInput(value)
+    if (!Array.isArray(input)) return input
+    return [
+      ...input.filter((item) => asRecord(item)?.type !== "compaction_trigger"),
+      { type: "compaction_trigger" },
+    ]
+  }
   if (key === "instructions" && (value === "" || isOpenCodeCompactionDeveloperPrompt(value))) return undefined
   return value
 }
@@ -465,6 +463,14 @@ export function compactBody(
     const value = compactBodyValue(key, body[key])
     if (value !== undefined) result[key] = value
   }
+  if (!config.compactBodyKeys.includes("input")) {
+    const input = compactBodyValue("input", body.input)
+    if (input !== undefined) result.input = input
+  }
+  result.tool_choice = "auto"
+  result.store = false
+  result.stream = true
+  result.include = ["reasoning.encrypted_content"]
   return result
 }
 
@@ -493,6 +499,79 @@ function usageFrom(value: AnyRecord | undefined): AnyRecord {
 
 function responseMessageID(responseID: string) {
   return `msg_${responseID.replace(/[^a-zA-Z0-9]/g, "_")}`
+}
+
+function compactedItemsForV2(input: unknown, compaction: AnyRecord): AnyRecord[] | undefined {
+  if (!Array.isArray(input)) return undefined
+  const retained = input.filter((item) => asRecord(item)?.role === "user")
+  return compactedItemsFrom([...retained, compaction])
+}
+
+async function compactV2Payload(response: Response): Promise<AnyRecord | undefined> {
+  const text = await response.text()
+  const data: string[] = []
+  let lines: string[] = []
+  const flush = () => {
+    if (lines.length) data.push(lines.join("\n"))
+    lines = []
+  }
+
+  for (const line of text.replace(/^\uFEFF/, "").split(/\r?\n/)) {
+    if (!line) {
+      flush()
+      continue
+    }
+    if (line.startsWith(":")) continue
+    const separator = line.indexOf(":")
+    const field = separator === -1 ? line : line.slice(0, separator)
+    if (field !== "data") continue
+    const value = separator === -1 ? "" : line.slice(separator + 1)
+    lines.push(value.startsWith(" ") ? value.slice(1) : value)
+  }
+  flush()
+
+  let completed: AnyRecord | undefined
+  let compaction: AnyRecord | undefined
+  let compactionCount = 0
+  for (const value of data) {
+    if (value === "[DONE]") continue
+    let event: AnyRecord | undefined
+    try {
+      event = asRecord(JSON.parse(value))
+    } catch {
+      return undefined
+    }
+    if (
+      !event ||
+      event.type === "error" ||
+      event.type === "response.failed" ||
+      event.type === "response.incomplete"
+    ) {
+      return undefined
+    }
+    if (event.type === "response.output_item.done") {
+      const item = asRecord(event.item)
+      if (item?.type === "compaction") {
+        compactionCount++
+        compaction ??= item
+      }
+    }
+    if (event.type === "response.completed") {
+      if (completed) return undefined
+      completed = asRecord(event.response)
+    }
+  }
+
+  if (
+    !completed ||
+    (completed.status !== undefined && completed.status !== "completed") ||
+    compactionCount !== 1 ||
+    !compaction ||
+    typeof compaction.encrypted_content !== "string"
+  ) {
+    return undefined
+  }
+  return { ...completed, compaction }
 }
 
 function sseResponse(input: {
@@ -888,15 +967,14 @@ export function createCompactHooks(
         return baseFetch(routedRequestInput, routedRequestInit)
       }
 
-      if (!body?.model || !body.input || !url) {
+      if (!body?.model || !Array.isArray(body.input) || !url) {
         takeStructuredSnapshot(sessionID)
         return baseFetch(routedRequestInput, routedRequestInit)
       }
 
       const outboundCompactHeaders = new Headers(routedRequestInit.headers)
       outboundCompactHeaders.set("content-type", "application/json")
-      const shouldRestoreStructure =
-        config.compactBodyKeys.includes("input") && isEmbeddedOpenCodeCompactionInput(body.input)
+      const shouldRestoreStructure = isEmbeddedOpenCodeCompactionInput(body.input)
       const structuredInput = shouldRestoreStructure
         ? structuredInputFor(
             providerID,
@@ -906,14 +984,13 @@ export function createCompactHooks(
         : undefined
       if (!shouldRestoreStructure) takeStructuredSnapshot(sessionID)
       const compactBodyWithHistory = compactBody(body, provider.compactModel, config)
-      if (structuredInput) compactBodyWithHistory.input = structuredInput
+      if (structuredInput) compactBodyWithHistory.input = [...structuredInput, { type: "compaction_trigger" }]
       const compactRequestBody = withStableInstructions(
         compactBodyWithHistory,
         stableInstructionsByProvider.get(providerID)?.get(sessionID),
         config.compactBodyKeys.includes("instructions"),
       )
-      if (providerID === "openai" && !openAIOAuthRequestInit) delete compactRequestBody.service_tier
-      const compacted = await baseFetch(openAIOAuthRequestInit ? chatGPTCodexCompactEndpoint : compactUrl(url, config), {
+      const compacted = await baseFetch(routedRequestInput, {
         ...routedRequestInit,
         method: "POST",
         headers: outboundCompactHeaders,
@@ -923,14 +1000,17 @@ export function createCompactHooks(
         return compacted
       }
 
-      const payload = asRecord(await compacted.clone().json().catch(() => undefined))
-      const items = compactedItemsFrom(payload?.output)
+      const payload = await compactV2Payload(compacted.clone()).catch(() => undefined)
+      const compaction = asRecord(payload?.compaction)
+      const items = compaction ? compactedItemsForV2(compactRequestBody.input, compaction) : undefined
       if (!items) {
-        return new Response("OpenAI compact response must contain exactly one valid compaction item", { status: 502 })
+        return new Response("OpenAI compact response stream must complete with exactly one valid compaction item", {
+          status: 502,
+        })
       }
       const responseID = typeof payload?.id === "string" ? payload.id : undefined
       if (!responseID) {
-        return compacted
+        return new Response("OpenAI compact response.completed event must contain a response id", { status: 502 })
       }
 
       const checkpoint = addCheckpoint(

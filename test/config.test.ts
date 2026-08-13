@@ -48,7 +48,10 @@ describe("loadConfig", () => {
     await writeFile(path.join(global, "openai-compact.json"), `{ "providers": { "openai": { "compactModel": "global-model" } } }`)
     await writeFile(path.join(global, "openai-compact.jsonc"), `{ "state": { "retentionDays": 10 } }`)
     await writeFile(path.join(customDir, "openai-compact.json"), `{ "providers": { "custom-openai": { "compactModel": "custom-model" } } }`)
-    await writeFile(path.join(customDir, "openai-compact.jsonc"), `{ "responses": { "endpointPath": "responses" } }`)
+    await writeFile(
+      path.join(customDir, "openai-compact.jsonc"),
+      `{ "responses": { "endpointPath": "responses", "compactEndpointPath": "legacy/compact" } }`,
+    )
     await writeFile(path.join(parentOpencode, "openai-compact.jsonc"), `{ "summary": "ignored" }`)
     await writeFile(path.join(nearestOpencode, "openai-compact.json"), `{ "summary": "nearest" }`)
     await writeFile(path.join(nearestOpencode, "openai-compact.jsonc"), `{ "summary": "nearest-jsonc" }`)
@@ -62,6 +65,7 @@ describe("loadConfig", () => {
     expect(config.providers["custom-openai"]?.compactModel).toBe("custom-model")
     expect(config.state.retentionDays).toBe(10)
     expect(config.responses.endpointPath).toBe("/responses")
+    expect(config.responses.compactEndpointPath).toBe("/legacy/compact")
     expect(config.summary).toBe("nearest-jsonc")
     expect(config.state.deleteOnSessionDeleted).toBe(true)
   })

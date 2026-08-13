@@ -31,7 +31,7 @@
           "compactModel": {
             "type": "string",
             "minLength": 1,
-            "description": "Model sent to the OpenAI Responses compact endpoint for this provider."
+            "description": "Model sent to the OpenAI Responses API compaction v2 request for this provider."
           }
         }
       },
@@ -71,7 +71,8 @@
           "type": "string",
           "minLength": 1,
           "default": "/responses/compact",
-          "description": "Responses API compact endpoint path used for compaction calls."
+          "deprecated": true,
+          "description": "Deprecated compatibility field. Compaction v2 always uses endpointPath."
         }
       }
     },
@@ -91,7 +92,7 @@
         "type": "string",
         "minLength": 1
       },
-      "description": "Request body keys copied from the original responses request into the compact request."
+      "description": "Request body keys copied from the original responses request into the compaction v2 request."
     },
     "summary": {
       "type": "string",

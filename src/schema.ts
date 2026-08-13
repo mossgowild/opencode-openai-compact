@@ -78,6 +78,7 @@ export const OpenAICompactConfigSchema = z
     responses: z
       .object({
         endpointPath: z.string().min(1).transform(endpoint).default(defaultResponses.endpointPath),
+        // Kept so existing config files continue to load; compaction v2 uses endpointPath.
         compactEndpointPath: z.string().min(1).transform(endpoint).default(defaultResponses.compactEndpointPath),
       })
       .default(defaultResponses),
