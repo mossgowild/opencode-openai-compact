@@ -18,11 +18,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Setup pnpm and Node.js
-        uses: pnpm/setup@v2
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
         with:
-          runtime: node@24
-          install: false
+          version: 11.21.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile --ignore-scripts
@@ -49,6 +53,13 @@ jobs:
 
       - name: Upgrade npm for trusted publishing
         run: npm install -g npm@latest
+
+      - name: Verify OIDC availability
+        run: |
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "::error::GitHub OIDC token request variables are unavailable; ensure the job has id-token: write permission"
+            exit 1
+          fi
 
       - name: Publish to npm
         run: |
