@@ -19,6 +19,7 @@ function compactResponse(payload: any) {
 }
 
 const defaultCompactModel = defaultConfig.providers.openai.compactModel
+const compactionInstructions = "You are an anchored context summarization assistant for coding sessions."
 
 describe("OpenAI compact hooks", () => {
   test("wraps the configured provider fetch", async () => {
@@ -144,7 +145,44 @@ describe("OpenAI compact hooks", () => {
     })
   })
 
-  test("restores structured compact input from pre-serialization messages", async () => {
+  test("preserves OpenCode 1.18.18 tagged conversation input", () => {
+    const developerPrompt =
+      "You are a context summarization agent. You are given a conversation between a user and an agent."
+    const content = [
+      "Here is the conversation so far:",
+      "<conversation>",
+      "[User]: fix compact request",
+      "[Assistant]: inspecting request",
+      "</conversation>",
+      "Here is the summary of the conversation before the <conversation> above:",
+      "<prior-summary>",
+      "## Objective\n- Preserve the task",
+      "</prior-summary>",
+    ].join("\n\n")
+
+    expect(
+      compactBody({
+        model: "ignored",
+        instructions: developerPrompt,
+        input: [
+          { role: "developer", content: developerPrompt },
+          { role: "user", content: [{ type: "input_text", text: content }] },
+        ],
+      }),
+    ).toEqual({
+      model: defaultCompactModel,
+      input: [
+        { role: "user", content: [{ type: "input_text", text: content }] },
+        { type: "compaction_trigger" },
+      ],
+      tool_choice: "auto",
+      store: false,
+      stream: true,
+      include: ["reasoning.encrypted_content"],
+    })
+  })
+
+  test("restores structured compact input without inspecting the serialized prompt", async () => {
     const store = CheckpointStore.openMemory()
     const calls: Array<{ url: string; init?: RequestInit }> = []
     const fakeFetch = (async (requestInput: RequestInfo | URL, init?: RequestInit) => {
@@ -216,11 +254,7 @@ describe("OpenAI compact hooks", () => {
         } as any,
       )
 
-      const embedded = [
-        "Create a new anchored summary from the conversation history.",
-        "The following is the conversation history:",
-        "[User]: flattened history that must not be sent",
-      ].join("\n\n")
+      const embedded = "Unrecognized future compaction format with flattened history that must not be sent"
       await wrappedFetch("https://proxy.test/openai/v1/responses", {
         method: "POST",
         headers: {
@@ -229,7 +263,7 @@ describe("OpenAI compact hooks", () => {
         },
         body: JSON.stringify({
           model: defaultCompactModel,
-          instructions: "You are an anchored context summarization assistant for coding sessions.",
+          instructions: "Unrecognized future compaction agent instructions.",
           input: [{ role: "user", content: [{ type: "input_text", text: embedded }] }],
         }),
       })
@@ -416,9 +450,14 @@ describe("OpenAI compact hooks", () => {
       )
 
       const embedded = [
-        "Create a new anchored summary from the conversation history.",
-        "The following is the conversation history:",
+        "Here is the conversation so far:",
+        "<conversation>",
         "[User]: preserved fallback history",
+        "</conversation>",
+        "Here is the summary of the conversation before the <conversation> above:",
+        "<prior-summary>",
+        "## Objective\n- Preserve the fallback",
+        "</prior-summary>",
       ].join("\n\n")
       await wrappedFetch("https://proxy.test/openai/v1/responses", {
         method: "POST",
@@ -428,7 +467,8 @@ describe("OpenAI compact hooks", () => {
         },
         body: JSON.stringify({
           model: "ignored",
-          instructions: "You are an anchored context summarization assistant for coding sessions.",
+          instructions:
+            "You are a context summarization agent. You are given a conversation between a user and an agent.",
           input: [{ role: "user", content: embedded }],
         }),
       })
@@ -441,6 +481,82 @@ describe("OpenAI compact hooks", () => {
         stream: true,
         include: ["reasoning.encrypted_content"],
       })
+    } finally {
+      store.close()
+    }
+  })
+
+  test("passes through an unknown compaction format after capture fails and clears its state", async () => {
+    const store = CheckpointStore.openMemory()
+    const calls: Array<{ url: string; init?: RequestInit }> = []
+    const fakeFetch = (async (requestInput: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(requestInput), init })
+      return new Response("original summary response", { status: 200 })
+    }) as typeof fetch
+
+    try {
+      const hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+      const cfg: any = {}
+      await hooks.config?.(cfg)
+      const sessionID = "ses_unknown_compaction"
+      await hooks["experimental.session.compacting"]?.(
+        { sessionID } as any,
+        { context: [], prompt: undefined },
+      )
+      await hooks["experimental.chat.messages.transform"]?.(
+        {},
+        {
+          messages: [
+            {
+              info: { id: "msg_uncloneable_unknown", sessionID, role: "user" },
+              parts: [{ type: "text", text: "history", metadata: { uncloneable: () => undefined } }],
+            },
+          ],
+        } as any,
+      )
+      const body = {
+        model: defaultCompactModel,
+        instructions: "Unknown future summarizer instructions.",
+        input: [{ role: "user", content: "Unknown future serialized summary request." }],
+      }
+      const response = await cfg.provider.openai.options.fetch("https://proxy.test/openai/v1/responses", {
+        method: "POST",
+        headers: {
+          [defaultConfig.headers.compact]: "1",
+          [defaultConfig.headers.session]: sessionID,
+        },
+        body: JSON.stringify(body),
+      })
+
+      expect(await response.text()).toBe("original summary response")
+      expect(calls).toHaveLength(1)
+      expect(calls[0]?.url).toBe("https://proxy.test/openai/v1/responses")
+      expect(jsonBody(calls[0]?.init)).toEqual(body)
+      expect(new Headers(calls[0]?.init?.headers).has(defaultConfig.headers.compact)).toBe(false)
+      expect(new Headers(calls[0]?.init?.headers).has(defaultConfig.headers.session)).toBe(false)
+      expect(store.count()).toBe(0)
+
+      await hooks["experimental.chat.messages.transform"]?.(
+        {},
+        {
+          messages: [
+            {
+              info: { id: "msg_after_failed_capture", sessionID, role: "user" },
+              parts: [{ type: "text", text: "must not become a stale snapshot" }],
+            },
+          ],
+        } as any,
+      )
+      const second = await cfg.provider.openai.options.fetch("https://proxy.test/openai/v1/responses", {
+        method: "POST",
+        headers: {
+          [defaultConfig.headers.compact]: "1",
+          [defaultConfig.headers.session]: sessionID,
+        },
+        body: JSON.stringify(body),
+      })
+      expect(await second.text()).toBe("original summary response")
+      expect(store.count()).toBe(0)
     } finally {
       store.close()
     }
@@ -751,7 +867,7 @@ describe("OpenAI compact hooks", () => {
           [config.headers.compact]: "1",
           [config.headers.session]: "ses_custom",
         },
-        body: JSON.stringify({ model: "ignored", input: [] }),
+        body: JSON.stringify({ model: "ignored", instructions: compactionInstructions, input: [] }),
       })
 
       expect(typeof cfg.provider.openai.options.fetch).toBe("function")
@@ -795,7 +911,12 @@ describe("OpenAI compact hooks", () => {
           [defaultConfig.headers.compact]: "1",
           [defaultConfig.headers.session]: "ses_request",
         },
-        body: JSON.stringify({ model: "ignored", input: [{ role: "user", content: "hello" }], stream: true }),
+        body: JSON.stringify({
+          model: "ignored",
+          instructions: compactionInstructions,
+          input: [{ role: "user", content: "hello" }],
+          stream: true,
+        }),
       })
 
       expect(calls[0]?.url).toBe("https://proxy.test/openai/v1/responses")
@@ -956,7 +1077,11 @@ describe("OpenAI compact hooks", () => {
           [defaultConfig.headers.compact]: "1",
           [defaultConfig.headers.session]: "ses_undo",
         },
-        body: JSON.stringify({ model: "ignored", input: [{ role: "user", content: "before compact" }] }),
+        body: JSON.stringify({
+          model: "ignored",
+          instructions: compactionInstructions,
+          input: [{ role: "user", content: "before compact" }],
+        }),
       })
       await hooks.event?.({
         event: {
@@ -1046,7 +1171,11 @@ describe("OpenAI compact hooks", () => {
           [defaultConfig.headers.compact]: "1",
           [defaultConfig.headers.session]: "ses_invalid",
         },
-        body: JSON.stringify({ model: "ignored", input: [{ role: "user", content: "hello" }] }),
+        body: JSON.stringify({
+          model: "ignored",
+          instructions: compactionInstructions,
+          input: [{ role: "user", content: "hello" }],
+        }),
       })
 
       expect(response.status).toBe(502)
@@ -1087,7 +1216,11 @@ describe("OpenAI compact hooks", () => {
           [defaultConfig.headers.compact]: "1",
           [defaultConfig.headers.session]: "ses_invalid_stream",
         },
-        body: JSON.stringify({ model: "ignored", input: [{ role: "user", content: "hello" }] }),
+        body: JSON.stringify({
+          model: "ignored",
+          instructions: compactionInstructions,
+          input: [{ role: "user", content: "hello" }],
+        }),
       })
 
       expect(response.status).toBe(502)
@@ -1118,7 +1251,11 @@ describe("OpenAI compact hooks", () => {
       await cfg.provider.openai.options.fetch("https://proxy.test/v1/responses", {
         method: "POST",
         headers: { [config.headers.compact]: "1", [config.headers.session]: "ses_deprecated_path" },
-        body: JSON.stringify({ model: "ignored", input: [{ role: "user", content: "hello" }] }),
+        body: JSON.stringify({
+          model: "ignored",
+          instructions: compactionInstructions,
+          input: [{ role: "user", content: "hello" }],
+        }),
       })
 
       expect(calls).toEqual(["https://proxy.test/v1/responses"])

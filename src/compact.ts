@@ -53,13 +53,19 @@ type CompactHookOptions = {
 const wrappedFetch = "__opencodeOpenAICompactFetch"
 const wrappedBaseFetch = "__opencodeOpenAICompactBaseFetch"
 const chatGPTCodexResponsesEndpoint = "https://chatgpt.com/backend-api/codex/responses"
-const openCodeCompactionDeveloperPrompt = "You are an anchored context summarization assistant for coding sessions."
+const openCodeCompactionDeveloperPromptStarts = [
+  "You are an anchored context summarization assistant for coding sessions.",
+  "You are a context summarization agent. You are given a conversation between a user and an agent.",
+] as const
 const utilityAgents = new Set(["compaction", "title", "summary"])
 const openCodeCompactionUserPromptStarts = [
   "Create a new anchored summary from the conversation history.",
   "Update the anchored summary below using the conversation history above.",
 ] as const
 const openCodeConversationHistoryMarker = "The following is the conversation history:"
+const openCodeConversationIntro = "Here is the conversation so far:"
+const openCodeConversationOpenTag = "<conversation>"
+const openCodeConversationCloseTag = "</conversation>"
 const openCodeCompactionQuestion = "What did we do so far?"
 const openCodeCompactionContinuation =
   "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed."
@@ -162,12 +168,26 @@ function contentText(value: unknown): string {
 }
 
 function isOpenCodeCompactionDeveloperPrompt(value: unknown) {
-  return contentText(value).trimStart().startsWith(openCodeCompactionDeveloperPrompt)
+  const text = contentText(value).trimStart()
+  return openCodeCompactionDeveloperPromptStarts.some((start) => text.startsWith(start))
+}
+
+function isTaggedOpenCodeConversation(value: unknown) {
+  const text = contentText(value).trimStart()
+  if (!text.startsWith(openCodeConversationIntro)) return false
+  const open = text.indexOf(openCodeConversationOpenTag, openCodeConversationIntro.length)
+  if (open === -1) return false
+  return text.indexOf(openCodeConversationCloseTag, open + openCodeConversationOpenTag.length) !== -1
 }
 
 function isOpenCodeCompactionUserPrompt(value: unknown) {
   const text = contentText(value).trimStart()
-  return openCodeCompactionUserPromptStarts.some((start) => text.startsWith(start))
+  return openCodeCompactionUserPromptStarts.some((start) => text.startsWith(start)) || isTaggedOpenCodeConversation(value)
+}
+
+function hasEmbeddedOpenCodeConversation(value: unknown) {
+  if (isTaggedOpenCodeConversation(value)) return true
+  return isOpenCodeCompactionUserPrompt(value) && contentText(value).includes(openCodeConversationHistoryMarker)
 }
 
 function compactInput(value: unknown) {
@@ -180,7 +200,7 @@ function compactInput(value: unknown) {
       index === value.length - 1 &&
       record.role === "user" &&
       isOpenCodeCompactionUserPrompt(record.content) &&
-      !contentText(record.content).includes(openCodeConversationHistoryMarker)
+      !hasEmbeddedOpenCodeConversation(record.content)
     ) {
       return false
     }
@@ -188,14 +208,11 @@ function compactInput(value: unknown) {
   })
 }
 
-function isEmbeddedOpenCodeCompactionInput(value: unknown) {
-  if (!Array.isArray(value)) return false
-  const last = asRecord(value.at(-1))
-  return (
-    last?.role === "user" &&
-    isOpenCodeCompactionUserPrompt(last.content) &&
-    contentText(last.content).includes(openCodeConversationHistoryMarker)
-  )
+function isKnownOpenCodeCompactionBody(body: AnyRecord) {
+  if (isOpenCodeCompactionDeveloperPrompt(body.instructions)) return true
+  if (!Array.isArray(body.input)) return false
+  const last = asRecord(body.input.at(-1))
+  return last?.role === "user" && isOpenCodeCompactionUserPrompt(last.content)
 }
 
 function truncateToolOutput(value: string) {
@@ -888,6 +905,11 @@ export function createCompactHooks(
     return snapshot
   }
 
+  function clearStructuredCapture(sessionID: string) {
+    pendingCompactionCaptures.delete(sessionID)
+    structuredCompactionSnapshots.delete(sessionID)
+  }
+
   function structuredInputFor(providerID: string, sessionID: string, sourceModel: string) {
     const snapshot = takeStructuredSnapshot(sessionID)
     const messages = snapshot?.messages ? cloneMessages(snapshot.messages) : undefined
@@ -968,22 +990,24 @@ export function createCompactHooks(
       }
 
       if (!body?.model || !Array.isArray(body.input) || !url) {
-        takeStructuredSnapshot(sessionID)
+        clearStructuredCapture(sessionID)
+        return baseFetch(routedRequestInput, routedRequestInit)
+      }
+
+      const structuredInput = structuredInputFor(
+        providerID,
+        sessionID,
+        typeof body.model === "string" ? body.model : provider.compactModel,
+      )
+      if (!structuredInput) clearStructuredCapture(sessionID)
+      if (!structuredInput && !isKnownOpenCodeCompactionBody(body)) {
         return baseFetch(routedRequestInput, routedRequestInit)
       }
 
       const outboundCompactHeaders = new Headers(routedRequestInit.headers)
       outboundCompactHeaders.set("content-type", "application/json")
-      const shouldRestoreStructure = isEmbeddedOpenCodeCompactionInput(body.input)
-      const structuredInput = shouldRestoreStructure
-        ? structuredInputFor(
-            providerID,
-            sessionID,
-            typeof body.model === "string" ? body.model : provider.compactModel,
-          )
-        : undefined
-      if (!shouldRestoreStructure) takeStructuredSnapshot(sessionID)
       const compactBodyWithHistory = compactBody(body, provider.compactModel, config)
+      delete compactBodyWithHistory.instructions
       if (structuredInput) compactBodyWithHistory.input = [...structuredInput, { type: "compaction_trigger" }]
       const compactRequestBody = withStableInstructions(
         compactBodyWithHistory,
@@ -1052,8 +1076,7 @@ export function createCompactHooks(
       for (const sessions of activeCheckpointByProvider.values()) sessions.delete(sessionID)
       for (const sessions of stableInstructionsByProvider.values()) sessions.delete(sessionID)
       for (const sessions of pendingSystemByProvider.values()) sessions.delete(sessionID)
-      pendingCompactionCaptures.delete(sessionID)
-      structuredCompactionSnapshots.delete(sessionID)
+      clearStructuredCapture(sessionID)
       for (const key of providerByMessage.keys()) {
         if (key.startsWith(`${sessionID}\0`)) providerByMessage.delete(key)
       }
@@ -1068,8 +1091,7 @@ export function createCompactHooks(
       if (typeof sessionID !== "string" || typeof messageID !== "string") return
 
       providerByMessage.delete(messageProviderKey(sessionID, messageID))
-      pendingCompactionCaptures.delete(sessionID)
-      structuredCompactionSnapshots.delete(sessionID)
+      clearStructuredCapture(sessionID)
       for (const [providerID, sessions] of checkpointsByProvider) {
         const checkpoints = sessions.get(sessionID)
         if (!checkpoints) continue

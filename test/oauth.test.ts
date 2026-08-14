@@ -19,6 +19,8 @@ function compactResponse(payload: any) {
   })
 }
 
+const compactionInstructions = "You are an anchored context summarization assistant for coding sessions."
+
 describe("OpenAI OAuth hooks", () => {
   test("keeps OpenAI connect methods available", async () => {
     const store = CheckpointStore.openMemory()
@@ -172,6 +174,7 @@ describe("OpenAI OAuth hooks", () => {
         },
         body: JSON.stringify({
           model: "ignored",
+          instructions: compactionInstructions,
           input: [{ role: "user", content: "hello" }],
           service_tier: "priority",
           prompt_cache_key: "cache-key",
@@ -250,7 +253,11 @@ describe("OpenAI OAuth hooks", () => {
           [defaultConfig.headers.compact]: "1",
           [defaultConfig.headers.session]: "ses_switch",
         },
-        body: JSON.stringify({ model: "ignored", input: [{ role: "user", content: "hello" }] }),
+        body: JSON.stringify({
+          model: "ignored",
+          instructions: compactionInstructions,
+          input: [{ role: "user", content: "hello" }],
+        }),
       })
 
       expect(calls[0]?.url).toBe("https://api.openai.com/v1/responses")
@@ -335,7 +342,11 @@ describe("OpenAI OAuth hooks", () => {
           [defaultConfig.headers.compact]: "1",
           [defaultConfig.headers.session]: "ses_dispose_switch",
         },
-        body: JSON.stringify({ model: "ignored", input: [{ role: "user", content: "hello" }] }),
+        body: JSON.stringify({
+          model: "ignored",
+          instructions: compactionInstructions,
+          input: [{ role: "user", content: "hello" }],
+        }),
       })
       expect(apiStore.count()).toBe(1)
 
@@ -365,7 +376,11 @@ describe("OpenAI OAuth hooks", () => {
           [defaultConfig.headers.compact]: "1",
           [defaultConfig.headers.session]: "ses_dispose_switch",
         },
-        body: JSON.stringify({ model: "ignored", input: [{ role: "user", content: "after switch" }] }),
+        body: JSON.stringify({
+          model: "ignored",
+          instructions: compactionInstructions,
+          input: [{ role: "user", content: "after switch" }],
+        }),
       })
 
       expect(response.ok).toBe(true)
@@ -414,6 +429,7 @@ describe("OpenAI OAuth hooks", () => {
         },
         body: JSON.stringify({
           model: "ignored",
+          instructions: compactionInstructions,
           input: [{ role: "user", content: "hello" }],
           service_tier: "priority",
           prompt_cache_key: "cache-key",
