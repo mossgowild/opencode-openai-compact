@@ -69,7 +69,7 @@ Requirements:
 | Runtime | Version |
 | --- | --- |
 | Node.js | `>=22.12.0` |
-| OpenCode | `>=1.3.8` |
+| OpenCode | `>=1.3.8` (Tested with 1.18.18) |
 
 ## Configuration Files
 
