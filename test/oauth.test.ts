@@ -152,7 +152,7 @@ describe("OpenAI OAuth hooks", () => {
       if (headers.get("authorization") !== "Bearer sk-test") return new Response("unauthorized", { status: 401 })
       return compactResponse({
         id: "resp_compacted",
-        model: defaultConfig.providers.openai.compactModel,
+        model: "ignored",
         created_at: 1,
         output: [{ type: "compaction", encrypted_content: "compacted" }],
       })
@@ -231,7 +231,7 @@ describe("OpenAI OAuth hooks", () => {
       if (jsonBody(init).input?.at(-1)?.type === "compaction_trigger") {
         return compactResponse({
           id: "resp_api_compacted",
-          model: defaultConfig.providers.openai.compactModel,
+          model: "ignored",
           created_at: 1,
           output: [{ type: "compaction", encrypted_content: "api-compacted" }],
         })
@@ -322,7 +322,7 @@ describe("OpenAI OAuth hooks", () => {
       calls.push({ url: String(requestInput), init })
       return compactResponse({
         id: "resp_after_switch",
-        model: defaultConfig.providers.openai.compactModel,
+        model: "ignored",
         created_at: 1,
         output: [{ type: "compaction", encrypted_content: "after-switch" }],
       })

@@ -45,7 +45,7 @@ describe("loadConfig", () => {
     await mkdir(nearestOpencode, { recursive: true })
     await mkdir(nested, { recursive: true })
 
-    await writeFile(path.join(global, "openai-compact.json"), `{ "providers": { "openai": { "compactModel": "global-model" } } }`)
+    await writeFile(path.join(global, "openai-compact.json"), `{ "providers": { "openai": { "compactModel": "global-model", "compactReasoningEffort": "minimal" } } }`)
     await writeFile(path.join(global, "openai-compact.jsonc"), `{ "state": { "retentionDays": 10 } }`)
     await writeFile(path.join(customDir, "openai-compact.json"), `{ "providers": { "custom-openai": { "compactModel": "custom-model" } } }`)
     await writeFile(
@@ -62,7 +62,9 @@ describe("loadConfig", () => {
     const config = await loadConfig({ directory: nested, worktree: project })
 
     expect(config.providers.openai?.compactModel).toBe("global-model")
+    expect(config.providers.openai?.compactReasoningEffort).toBe("minimal")
     expect(config.providers["custom-openai"]?.compactModel).toBe("custom-model")
+    expect(config.providers["custom-openai"]?.compactReasoningEffort).toBeNull()
     expect(config.state.retentionDays).toBe(10)
     expect(config.responses.endpointPath).toBe("/responses")
     expect(config.responses.compactEndpointPath).toBe("/legacy/compact")

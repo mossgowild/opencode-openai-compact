@@ -20,18 +20,25 @@
       "minProperties": 1,
       "default": {
         "openai": {
-          "compactModel": "gpt-5.4"
+          "compactModel": null,
+          "compactReasoningEffort": null
         }
       },
       "additionalProperties": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["compactModel"],
         "properties": {
           "compactModel": {
-            "type": "string",
+            "type": ["string", "null"],
             "minLength": 1,
-            "description": "Model sent to the OpenAI Responses API compaction v2 request for this provider."
+            "default": null,
+            "description": "Model sent to the OpenAI Responses API compaction v2 request for this provider. Null follows the model used by the latest conversation part."
+          },
+          "compactReasoningEffort": {
+            "type": ["string", "null"],
+            "enum": [null, "none", "minimal", "low", "medium", "high", "xhigh", "max"],
+            "default": null,
+            "description": "Reasoning effort sent to the compaction v2 request. Null follows the effort selected for the current conversation."
           }
         }
       },

@@ -16,6 +16,9 @@ export const defaultCompactSummary = [
   "Following conversations will continue from this compacted checkpoint.",
 ].join("\n")
 
+export const compactReasoningEfforts = ["none", "minimal", "low", "medium", "high", "xhigh", "max"] as const
+export type CompactReasoningEffort = (typeof compactReasoningEfforts)[number]
+
 const defaultHeaders = {
   compact: "x-opencode-openai-responses-compact",
   session: "x-opencode-openai-responses-compact-session",
@@ -33,7 +36,8 @@ const defaultState = {
 
 const defaultProviders = {
   openai: {
-    compactModel: "gpt-5.4",
+    compactModel: null,
+    compactReasoningEffort: null,
   },
 }
 
@@ -63,7 +67,8 @@ export const OpenAICompactConfigSchema = z
         z.string().min(1),
         z
           .object({
-            compactModel: z.string().min(1),
+            compactModel: z.string().min(1).nullable().default(null),
+            compactReasoningEffort: z.enum(compactReasoningEfforts).nullable().default(null),
           })
           .strict(),
       )

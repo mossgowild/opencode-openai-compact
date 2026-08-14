@@ -18,10 +18,26 @@ function compactResponse(payload: any) {
   })
 }
 
-const defaultCompactModel = defaultConfig.providers.openai.compactModel
 const compactionInstructions = "You are an anchored context summarization assistant for coding sessions."
+const currentModel = "gpt-current"
 
 describe("OpenAI compact hooks", () => {
+  test("defaults to following the conversation model and reasoning effort", () => {
+    expect(defaultConfig.providers.openai).toEqual({
+      compactModel: null,
+      compactReasoningEffort: null,
+    })
+    for (const effort of ["none", "minimal", "low", "medium", "high", "xhigh", "max"] as const) {
+      expect(
+        OpenAICompactConfigSchema.parse({ providers: { openai: { compactReasoningEffort: effort } } }).providers
+          .openai,
+      ).toEqual({ compactModel: null, compactReasoningEffort: effort })
+    }
+    expect(() =>
+      OpenAICompactConfigSchema.parse({ providers: { openai: { compactReasoningEffort: "unsupported" } } }),
+    ).toThrow()
+  })
+
   test("wraps the configured provider fetch", async () => {
     const store = CheckpointStore.openMemory()
     try {
@@ -44,7 +60,7 @@ describe("OpenAI compact hooks", () => {
       tools: [],
     })
     expect(body).toEqual({
-      model: defaultCompactModel,
+      model: "ignored",
       input: [{ role: "user", content: "hello" }, { type: "compaction_trigger" }],
       tools: [],
       tool_choice: "auto",
@@ -54,9 +70,29 @@ describe("OpenAI compact hooks", () => {
     })
 
     const withoutConfiguredInput = OpenAICompactConfigSchema.parse({ compactBodyKeys: [] })
-    expect(compactBody({ input: [] }, defaultCompactModel, withoutConfiguredInput).input).toEqual([
+    expect(compactBody({ input: [] }, currentModel, withoutConfiguredInput).input).toEqual([
       { type: "compaction_trigger" },
     ])
+  })
+
+  test("applies explicit compaction model and reasoning effort overrides", () => {
+    const config = OpenAICompactConfigSchema.parse({
+      providers: { openai: { compactModel: "gpt-compact", compactReasoningEffort: "max" } },
+    })
+    const provider = config.providers.openai
+    const body = compactBody(
+      {
+        model: currentModel,
+        reasoning: { effort: "low", summary: "auto" },
+        input: [{ role: "user", content: "hello" }],
+      },
+      provider.compactModel,
+      config,
+      provider.compactReasoningEffort,
+    )
+
+    expect(body.model).toBe("gpt-compact")
+    expect(body.reasoning).toEqual({ effort: "max", summary: "auto" })
   })
 
   test("builds standard compact input without OpenCode summarizer prompts", () => {
@@ -90,7 +126,7 @@ describe("OpenAI compact hooks", () => {
     })
 
     expect(body).toEqual({
-      model: defaultCompactModel,
+      model: "ignored",
       input: [
         { role: "developer", content: "Keep the user's coding preferences." },
         { role: "user", content: "Create a new anchored summary from the conversation history. This is quoted." },
@@ -133,7 +169,7 @@ describe("OpenAI compact hooks", () => {
     })
 
     expect(body).toEqual({
-      model: defaultCompactModel,
+      model: "ignored",
       input: [
         { role: "user", content: [{ type: "input_text", text: content }] },
         { type: "compaction_trigger" },
@@ -170,7 +206,7 @@ describe("OpenAI compact hooks", () => {
         ],
       }),
     ).toEqual({
-      model: defaultCompactModel,
+      model: "ignored",
       input: [
         { role: "user", content: [{ type: "input_text", text: content }] },
         { type: "compaction_trigger" },
@@ -222,7 +258,7 @@ describe("OpenAI compact hooks", () => {
                 sessionID,
                 role: "assistant",
                 providerID: "openai",
-                modelID: defaultCompactModel,
+                modelID: currentModel,
               },
               parts: [
                 {
@@ -262,7 +298,7 @@ describe("OpenAI compact hooks", () => {
           [defaultConfig.headers.session]: sessionID,
         },
         body: JSON.stringify({
-          model: defaultCompactModel,
+          model: currentModel,
           instructions: "Unrecognized future compaction agent instructions.",
           input: [{ role: "user", content: [{ type: "input_text", text: embedded }] }],
         }),
@@ -271,7 +307,7 @@ describe("OpenAI compact hooks", () => {
       expect(calls).toHaveLength(1)
       expect(calls[0]?.url).toBe("https://proxy.test/openai/v1/responses")
       expect(jsonBody(calls[0]?.init)).toEqual({
-        model: defaultCompactModel,
+        model: currentModel,
         input: [
           {
             role: "user",
@@ -306,6 +342,79 @@ describe("OpenAI compact hooks", () => {
         stream: true,
         include: ["reasoning.encrypted_content"],
       })
+    } finally {
+      store.close()
+    }
+  })
+
+  test("follows the latest conversation settings without inspecting the serialized prompt", async () => {
+    const store = CheckpointStore.openMemory()
+    const calls: Array<{ init?: RequestInit }> = []
+    const fakeFetch = (async (_requestInput: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ init })
+      return compactResponse({
+        id: "resp_follow_conversation",
+        created_at: 1,
+        output: [{ type: "compaction", encrypted_content: "compacted" }],
+      })
+    }) as typeof fetch
+
+    try {
+      const hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+      const cfg: any = {}
+      await hooks.config?.(cfg)
+      const sessionID = "ses_follow_conversation"
+
+      await hooks["experimental.session.compacting"]?.(
+        { sessionID } as any,
+        { context: [], prompt: undefined },
+      )
+      await hooks["experimental.chat.messages.transform"]?.(
+        {},
+        {
+          messages: [
+            {
+              info: {
+                id: "msg_old",
+                sessionID,
+                role: "assistant",
+                providerID: "openai",
+                modelID: "gpt-old",
+                variant: "low",
+              },
+              parts: [{ type: "text", text: "old response" }],
+            },
+            {
+              info: {
+                id: "msg_latest",
+                sessionID,
+                role: "user",
+                model: { providerID: "openai", modelID: "gpt-latest", variant: "xhigh" },
+              },
+              parts: [{ type: "text", text: "latest request" }],
+            },
+          ],
+        } as any,
+      )
+
+      const embedded = "Unrecognized future compaction format with flattened history"
+      await cfg.provider.openai.options.fetch("https://proxy.test/openai/v1/responses", {
+        method: "POST",
+        headers: {
+          [defaultConfig.headers.compact]: "1",
+          [defaultConfig.headers.session]: sessionID,
+        },
+        body: JSON.stringify({
+          model: "compaction-agent-model",
+          instructions: "Unrecognized future compaction agent instructions.",
+          reasoning: { effort: "medium", summary: "auto" },
+          input: [{ role: "user", content: embedded }],
+        }),
+      })
+
+      const body = jsonBody(calls[0]?.init)
+      expect(body.model).toBe("gpt-latest")
+      expect(body.reasoning).toEqual({ effort: "xhigh", summary: "auto" })
     } finally {
       store.close()
     }
@@ -395,7 +504,7 @@ describe("OpenAI compact hooks", () => {
       })
 
       expect(jsonBody(calls.at(-1)?.init)).toEqual({
-        model: defaultCompactModel,
+        model: "ignored",
         instructions: "You are OpenCode.",
         input: [
           { role: "developer", content: "Stable developer context." },
@@ -474,7 +583,7 @@ describe("OpenAI compact hooks", () => {
       })
 
       expect(jsonBody(calls[0]?.init)).toEqual({
-        model: defaultCompactModel,
+        model: "ignored",
         input: [{ role: "user", content: embedded }, { type: "compaction_trigger" }],
         tool_choice: "auto",
         store: false,
@@ -515,7 +624,7 @@ describe("OpenAI compact hooks", () => {
         } as any,
       )
       const body = {
-        model: defaultCompactModel,
+        model: currentModel,
         instructions: "Unknown future summarizer instructions.",
         input: [{ role: "user", content: "Unknown future serialized summary request." }],
       }
@@ -656,7 +765,7 @@ describe("OpenAI compact hooks", () => {
 
       expect(calls[0]?.url).toBe("https://proxy.test/openai/v1/responses")
       expect(jsonBody(calls[0]?.init)).toEqual({
-        model: defaultCompactModel,
+        model: "ignored",
         instructions: "You are OpenCode.",
         input: [
           { role: "developer", content: "stable instructions" },
@@ -757,7 +866,7 @@ describe("OpenAI compact hooks", () => {
 
       expect(calls[0]?.url).toBe("https://proxy.test/openai/v1/responses")
       expect(jsonBody(calls[0]?.init)).toEqual({
-        model: defaultCompactModel,
+        model: "ignored",
         instructions: "You are OpenCode.\n \nAGENTS instructions",
         input: [
           { role: "user", content: "hello" },
@@ -822,7 +931,7 @@ describe("OpenAI compact hooks", () => {
       })
 
       expect(jsonBody(calls[0]?.init)).toEqual({
-        model: defaultCompactModel,
+        model: "ignored",
         input: [
           { role: "developer", content: "stable instructions" },
           { role: "user", content: "hello" },
@@ -886,7 +995,7 @@ describe("OpenAI compact hooks", () => {
       calls.push({ url: String(requestInput), init })
       return compactResponse({
         id: "resp_compacted",
-        model: defaultCompactModel,
+        model: currentModel,
         created_at: 1,
         output: [
           {
@@ -921,7 +1030,7 @@ describe("OpenAI compact hooks", () => {
 
       expect(calls[0]?.url).toBe("https://proxy.test/openai/v1/responses")
       expect(jsonBody(calls[0]?.init)).toEqual({
-        model: defaultCompactModel,
+        model: "ignored",
         input: [{ role: "user", content: "hello" }, { type: "compaction_trigger" }],
         tool_choice: "auto",
         store: false,
@@ -1059,7 +1168,7 @@ describe("OpenAI compact hooks", () => {
       calls.push({ url: String(requestInput), init })
       return compactResponse({
         id: "resp_undo",
-        model: defaultCompactModel,
+        model: currentModel,
         created_at: 1,
         output: [{ type: "compaction", encrypted_content: "undo-compacted" }],
       })

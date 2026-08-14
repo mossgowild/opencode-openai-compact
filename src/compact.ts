@@ -1,5 +1,10 @@
 import type { Hooks } from "@opencode-ai/plugin"
-import { defaultConfig, type OpenAICompactConfig } from "./schema.js"
+import {
+  compactReasoningEfforts,
+  defaultConfig,
+  type CompactReasoningEffort,
+  type OpenAICompactConfig,
+} from "./schema.js"
 import {
   asOpenAIOAuth,
   createOpenAIOAuth,
@@ -21,6 +26,12 @@ type MessageEntry = {
     role?: string
     providerID?: string
     modelID?: string
+    variant?: string
+    model?: {
+      providerID?: string
+      modelID?: string
+      variant?: string
+    }
     error?: unknown
     time?: { created?: number }
   }
@@ -42,7 +53,12 @@ type MessageEntry = {
 }
 type MessageBoundary = { messageID: string; createdAt: number }
 type PendingCompactResult = { providerID: string; responseID: string; items: AnyRecord[] }
-type StructuredCompactionSnapshot = { messages?: MessageEntry[] }
+type ConversationSettings = {
+  providerID: string
+  modelID: string
+  reasoningEffort?: CompactReasoningEffort
+}
+type StructuredCompactionSnapshot = { messages?: MessageEntry[]; conversation?: ConversationSettings }
 type ProviderConfig = OpenAICompactConfig["providers"][string]
 type StableInstructions = { instructions?: unknown; inputPrefix: unknown[] }
 type CompactHookOptions = {
@@ -70,6 +86,7 @@ const openCodeCompactionQuestion = "What did we do so far?"
 const openCodeCompactionContinuation =
   "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed."
 const toolOutputMaxChars = 2_000
+const compactReasoningEffortSet = new Set<string>(compactReasoningEfforts)
 
 function asRecord(value: unknown): AnyRecord | undefined {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as AnyRecord) : undefined
@@ -77,6 +94,31 @@ function asRecord(value: unknown): AnyRecord | undefined {
 
 function finiteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value)
+}
+
+function compactReasoningEffort(value: unknown): CompactReasoningEffort | undefined {
+  return typeof value === "string" && compactReasoningEffortSet.has(value)
+    ? (value as CompactReasoningEffort)
+    : undefined
+}
+
+function conversationSettingsFrom(messages: MessageEntry[]): ConversationSettings | undefined {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index]
+    if (!message.parts?.length) continue
+
+    const info = message.info
+    if (!info) continue
+    const model = info.role === "user" ? info.model : info
+    if (typeof model?.providerID !== "string" || typeof model.modelID !== "string") continue
+
+    return {
+      providerID: model.providerID,
+      modelID: model.modelID,
+      reasoningEffort: compactReasoningEffort(model.variant),
+    }
+  }
+  return undefined
 }
 
 function urlOf(input: RequestInfo | URL): URL | undefined {
@@ -473,8 +515,10 @@ export function compactBody(
   body: AnyRecord,
   compactModel = defaultConfig.providers.openai.compactModel,
   config: OpenAICompactConfig = defaultConfig,
+  reasoningEffort = defaultConfig.providers.openai.compactReasoningEffort,
 ): AnyRecord {
-  const result: AnyRecord = { model: compactModel }
+  const model = compactModel ?? (typeof body.model === "string" ? body.model : undefined)
+  const result: AnyRecord = model ? { model } : {}
   for (const key of config.compactBodyKeys) {
     if (key === "model") continue
     const value = compactBodyValue(key, body[key])
@@ -484,6 +528,8 @@ export function compactBody(
     const input = compactBodyValue("input", body.input)
     if (input !== undefined) result.input = input
   }
+  const effort = reasoningEffort ?? compactReasoningEffort(asRecord(body.reasoning)?.effort)
+  if (effort) result.reasoning = { ...(asRecord(result.reasoning) ?? {}), effort }
   result.tool_choice = "auto"
   result.store = false
   result.stream = true
@@ -910,8 +956,12 @@ export function createCompactHooks(
     structuredCompactionSnapshots.delete(sessionID)
   }
 
-  function structuredInputFor(providerID: string, sessionID: string, sourceModel: string) {
-    const snapshot = takeStructuredSnapshot(sessionID)
+  function structuredInputFor(
+    providerID: string,
+    sessionID: string,
+    sourceModel: string,
+    snapshot: StructuredCompactionSnapshot | undefined,
+  ) {
     const messages = snapshot?.messages ? cloneMessages(snapshot.messages) : undefined
     if (!messages) return undefined
 
@@ -989,16 +1039,20 @@ export function createCompactHooks(
         return baseFetch(routedRequestInput, routedRequestInit)
       }
 
-      if (!body?.model || !Array.isArray(body.input) || !url) {
+      if (typeof body?.model !== "string" || !Array.isArray(body.input) || !url) {
         clearStructuredCapture(sessionID)
         return baseFetch(routedRequestInput, routedRequestInit)
       }
 
-      const structuredInput = structuredInputFor(
-        providerID,
-        sessionID,
-        typeof body.model === "string" ? body.model : provider.compactModel,
-      )
+      const snapshot = takeStructuredSnapshot(sessionID)
+      const conversation = snapshot?.conversation?.providerID === providerID ? snapshot.conversation : undefined
+      const selectedModel = provider.compactModel ?? conversation?.modelID ?? body.model
+      const selectedReasoningEffort =
+        provider.compactReasoningEffort ??
+        conversation?.reasoningEffort ??
+        compactReasoningEffort(asRecord(body.reasoning)?.effort) ??
+        null
+      const structuredInput = structuredInputFor(providerID, sessionID, selectedModel, snapshot)
       if (!structuredInput) clearStructuredCapture(sessionID)
       if (!structuredInput && !isKnownOpenCodeCompactionBody(body)) {
         return baseFetch(routedRequestInput, routedRequestInit)
@@ -1006,7 +1060,7 @@ export function createCompactHooks(
 
       const outboundCompactHeaders = new Headers(routedRequestInit.headers)
       outboundCompactHeaders.set("content-type", "application/json")
-      const compactBodyWithHistory = compactBody(body, provider.compactModel, config)
+      const compactBodyWithHistory = compactBody(body, selectedModel, config, selectedReasoningEffort)
       delete compactBodyWithHistory.instructions
       if (structuredInput) compactBodyWithHistory.input = [...structuredInput, { type: "compaction_trigger" }]
       const compactRequestBody = withStableInstructions(
@@ -1048,7 +1102,7 @@ export function createCompactHooks(
       getProviderSessionMap(activeCheckpointByProvider, providerID).set(sessionID, checkpoint)
       return sseResponse({
         responseID,
-        model: typeof payload?.model === "string" ? payload.model : provider.compactModel,
+        model: typeof payload?.model === "string" ? payload.model : selectedModel,
         createdAt: typeof payload?.created_at === "number" ? payload.created_at : Math.floor(Date.now() / 1000),
         summary: config.summary,
         usage: asRecord(payload?.usage),
@@ -1190,7 +1244,9 @@ export function createCompactHooks(
       const messages = output.messages as unknown as MessageEntry[]
       const sessionID = sessionIDFromMessages(messages)
       const pendingCaptures = sessionID ? pendingCompactionCaptures.get(sessionID) : undefined
-      const snapshot = pendingCaptures ? { messages: cloneMessages(messages) } : undefined
+      const snapshot = pendingCaptures
+        ? { messages: cloneMessages(messages), conversation: conversationSettingsFrom(messages) }
+        : undefined
       const providerID = transformProviderID(input, messages)
       if (providerID && configuredProviders.has(providerID)) trimMessagesAfterCheckpoint(providerID, messages)
       if (sessionID && pendingCaptures && snapshot) {
