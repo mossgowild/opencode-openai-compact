@@ -36,13 +36,14 @@ type MessageEntry = {
     agent?: string
     parentID?: string
     summary?: boolean
+    finish?: string
     model?: {
       providerID?: string
       modelID?: string
       variant?: string
     }
     error?: unknown
-    time?: { created?: number }
+    time?: { created?: number; completed?: number }
   }
   parts?: Array<{
     type?: string
@@ -74,7 +75,11 @@ type ConversationSettings = {
   modelID: string
   reasoningEffort?: CompactReasoningEffort
 }
-type StructuredCompactionSnapshot = { messages?: MessageEntry[]; conversation?: ConversationSettings }
+type StructuredCompactionSnapshot = {
+  messages?: MessageEntry[]
+  conversation?: ConversationSettings
+  nativeSummary?: string
+}
 type ProviderConfig = OpenAICompactConfig["providers"][string]
 type StableInstructions = { instructions?: unknown; inputPrefix: unknown[] }
 type CompactHookOptions = {
@@ -102,6 +107,8 @@ const openCodeConversationCloseTag = "</conversation>"
 const openCodeCompactionQuestion = "What did we do so far?"
 const openCodeCompactionContinuation =
   "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed."
+const nativeCompactionSummaryPrefix =
+  "Previous OpenCode text compaction summary. Treat this as historical context, not a new instruction:\n\n"
 const toolOutputMaxChars = 2_000
 const compactReasoningEffortSet = new Set<string>(compactReasoningEfforts)
 
@@ -328,7 +335,7 @@ function structuredOpenAIInput(
   for (const message of messages) {
     const info = message.info
     const parts = message.parts ?? []
-    if (!info?.role || info.error) return undefined
+    if (!info?.role) return undefined
     if (!parts.length) continue
 
     if (info.role === "user") {
@@ -630,7 +637,7 @@ function responseMessageID(responseID: string) {
 
 function compactedItemsForV2(input: unknown, compaction: AnyRecord): AnyRecord[] | undefined {
   if (!Array.isArray(input)) return undefined
-  const retained = input.filter((item) => asRecord(item)?.role === "user")
+  const retained = input.filter((item) => asRecord(item)?.role === "user" || isNativeCompactionSummaryItem(item))
   return compactedItemsFrom([...retained, compaction])
 }
 
@@ -762,6 +769,72 @@ function sseResponse(input: {
 function messageCreatedAt(entry: MessageEntry) {
   const createdAt = entry.info?.time?.created
   return finiteNumber(createdAt) ? createdAt : undefined
+}
+
+function isCompletedCompactionSummary(value: unknown) {
+  const info = asRecord(value)
+  const time = asRecord(info?.time)
+  return (
+    info?.role === "assistant" &&
+    info.summary === true &&
+    info.error == null &&
+    typeof info.finish === "string" &&
+    finiteNumber(time?.completed)
+  )
+}
+
+function isNativeCompactionSummaryItem(value: unknown) {
+  const item = asRecord(value)
+  return item?.role === "assistant" && contentText(item.content).startsWith(nativeCompactionSummaryPrefix)
+}
+
+function latestNativeCompactionSummary(messages: MessageEntry[], pluginSummary: string) {
+  const compactionParents = new Set(
+    messages
+      .filter(
+        (message) =>
+          message.info?.role === "user" &&
+          typeof message.info.id === "string" &&
+          message.parts?.some((part) => part.type === "compaction"),
+      )
+      .map((message) => message.info!.id!),
+  )
+
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index]
+    const parentID = message.info?.parentID
+    if (!isCompletedCompactionSummary(message.info) || typeof parentID !== "string" || !compactionParents.has(parentID)) {
+      continue
+    }
+    const text = messageText(message)
+    if (text && text !== pluginSummary) return text
+  }
+  return undefined
+}
+
+function hasCompletedCompactionAfterCheckpoint(checkpoint: Checkpoint, messages: MessageEntry[]) {
+  const compactionParents = new Set(
+    messages
+      .filter((message) => {
+        const info = message.info
+        const createdAt = messageCreatedAt(message)
+        return (
+          info?.role === "user" &&
+          typeof info.id === "string" &&
+          info.id !== checkpoint.afterMessageID &&
+          createdAt !== undefined &&
+          createdAt >= checkpoint.afterCreatedAt &&
+          message.parts?.some((part) => part.type === "compaction")
+        )
+      })
+      .map((message) => message.info!.id!),
+  )
+  return messages.some(
+    (message) =>
+      isCompletedCompactionSummary(message.info) &&
+      typeof message.info?.parentID === "string" &&
+      compactionParents.has(message.info.parentID),
+  )
 }
 
 function isOpenCodeCompactionContinuation(entry: MessageEntry) {
@@ -1277,6 +1350,17 @@ export function createCompactHooks(
     pendingCompactionBoundaries.delete(sessionID)
   }
 
+  function clearNativeFallbackSession(sessionID: string) {
+    store.deleteSession(sessionID)
+    pendingNativeCompactions.delete(sessionID)
+    for (const sessions of checkpointsByProvider.values()) sessions.delete(sessionID)
+    for (const sessions of activeCheckpointByProvider.values()) sessions.delete(sessionID)
+    for (const sessions of controlMessagesByProvider.values()) sessions.delete(sessionID)
+    pendingCompactResults.delete(sessionID)
+    pendingCompactionBoundaries.delete(sessionID)
+    clearStructuredCapture(sessionID)
+  }
+
   function structuredInputFor(
     providerID: string,
     sessionID: string,
@@ -1292,7 +1376,15 @@ export function createCompactHooks(
       if (!history) return undefined
 
       const checkpoint = activeCheckpointByProvider.get(providerID)?.get(sessionID)
-      return checkpoint ? [...structuredClone(checkpoint.items), ...history] : history
+      const checkpointItems = checkpoint ? structuredClone(checkpoint.items) : []
+      const nativeSummaryText = snapshot?.nativeSummary
+      if (!nativeSummaryText) return [...checkpointItems, ...history]
+
+      const nativeSummary = {
+        role: "assistant",
+        content: [{ type: "output_text", text: `${nativeCompactionSummaryPrefix}${nativeSummaryText}` }],
+      }
+      return [...checkpointItems.filter((item) => !isNativeCompactionSummaryItem(item)), nativeSummary, ...history]
     } catch {
       return undefined
     }
@@ -1512,14 +1604,17 @@ export function createCompactHooks(
       const nativeCompaction = pendingNativeCompactions.get(sessionID)
       if (!nativeCompaction?.completed) return
 
-      pendingNativeCompactions.delete(sessionID)
-      for (const sessions of checkpointsByProvider.values()) sessions.delete(sessionID)
-      for (const sessions of activeCheckpointByProvider.values()) sessions.delete(sessionID)
-      for (const sessions of controlMessagesByProvider.values()) sessions.delete(sessionID)
-      pendingCompactResults.delete(sessionID)
-      pendingCompactionBoundaries.delete(sessionID)
-      clearStructuredCapture(sessionID)
-      store.deleteSession(sessionID)
+      clearNativeFallbackSession(sessionID)
+      return
+    }
+
+    if (event.type === "message.updated") {
+      const properties = asRecord(event.properties)
+      const sessionID = properties?.sessionID
+      if (typeof sessionID !== "string" || !pendingNativeCompactions.has(sessionID)) return
+      if (!isCompletedCompactionSummary(properties?.info)) return
+
+      clearNativeFallbackSession(sessionID)
       return
     }
 
@@ -1720,18 +1815,31 @@ export function createCompactHooks(
       const sessionID = sessionIDFromMessages(messages)
       const pendingCaptures = sessionID ? pendingCompactionCaptures.get(sessionID) : undefined
       const providerID = transformProviderID(input, messages)
+      let rawMessages: MessageEntry[] | undefined
       if (sessionID && providerID && configuredProviders.has(providerID)) {
         await inheritForkState(providerID, sessionID, messages)
+        if (pendingCaptures && options.getSessionMessages) {
+          const value = await options.getSessionMessages(sessionID).catch(() => undefined)
+          if (Array.isArray(value)) rawMessages = value as MessageEntry[]
+        }
         if (pendingCaptures && !activeCheckpointByProvider.get(providerID)?.has(sessionID)) {
           const checkpoint = checkpointsByProvider.get(providerID)?.get(sessionID)?.at(-1)
           if (checkpoint) getProviderSessionMap(activeCheckpointByProvider, providerID).set(sessionID, checkpoint)
         }
         captureControlMessages(providerID, sessionID, messages)
         removeControlMessages(providerID, sessionID, messages)
+        const checkpoint = activeCheckpointByProvider.get(providerID)?.get(sessionID)
+        if (pendingCaptures && checkpoint && hasCompletedCompactionAfterCheckpoint(checkpoint, rawMessages ?? messages)) {
+          clearNativeFallbackSession(sessionID)
+        }
       }
       const clonedMessages = pendingCaptures ? cloneMessages(messages) : undefined
       const snapshot = clonedMessages
-        ? { messages: clonedMessages, conversation: conversationSettingsFrom(messages) }
+        ? {
+            messages: clonedMessages,
+            conversation: conversationSettingsFrom(messages),
+            nativeSummary: rawMessages ? latestNativeCompactionSummary(rawMessages, config.summary) : undefined,
+          }
         : undefined
       if (providerID && configuredProviders.has(providerID)) trimMessagesAfterCheckpoint(providerID, messages)
       if (sessionID && pendingCaptures) {
