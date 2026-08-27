@@ -68,6 +68,7 @@ type PendingAutoContinue = {
   compactionMessageID?: string
   compactionCreatedAt?: number
 }
+type PendingNativeCompaction = { providerID: string; checkpoint: Checkpoint; completed: boolean }
 type ConversationSettings = {
   providerID: string
   modelID: string
@@ -198,10 +199,12 @@ function fetchInitForReroute(input: RequestInfo | URL, init: RequestInit | undef
 
 function compactMarkers(headers: Headers, config: OpenAICompactConfig) {
   const sessionID = headers.get(config.headers.session) ?? undefined
-  const shouldCompact = headers.get(config.headers.compact) === "1"
+  const compact = headers.get(config.headers.compact)
+  const shouldCompact = compact === "1"
+  const shouldNativeCompact = compact === "native"
   headers.delete(config.headers.compact)
   headers.delete(config.headers.session)
-  return { sessionID, shouldCompact }
+  return { sessionID, shouldCompact, shouldNativeCompact }
 }
 
 async function bodyText(input: RequestInfo | URL, init?: RequestInit): Promise<string | undefined> {
@@ -253,6 +256,10 @@ function isOpenCodeCompactionUserPrompt(value: unknown) {
 function hasEmbeddedOpenCodeConversation(value: unknown) {
   if (isTaggedOpenCodeConversation(value)) return true
   return isOpenCodeCompactionUserPrompt(value) && contentText(value).includes(openCodeConversationHistoryMarker)
+}
+
+function hasInvalidCheckpointHistory(checkpoint: Checkpoint) {
+  return checkpoint.items.some((item) => item.role === "user" && hasEmbeddedOpenCodeConversation(item.content))
 }
 
 function compactInput(value: unknown) {
@@ -837,6 +844,7 @@ export function createCompactHooks(
   const failedCompactionCaptures = new Set<string>()
   const blockedCompactionRequests = new Set<string>()
   const structuredCompactionSnapshots = new Map<string, StructuredCompactionSnapshot[]>()
+  const pendingNativeCompactions = new Map<string, PendingNativeCompaction>()
   let openAIAuth: OpenAIOAuthAuth | undefined
   let openAIWrappedFetch: FetchLike | undefined
   const openAIOAuth = createOpenAIOAuth({
@@ -1164,13 +1172,14 @@ export function createCompactHooks(
     headers: Headers,
     sessionID: string,
     removeLatestUser: boolean,
+    selectedCheckpoint?: Checkpoint,
   ): Promise<RequestInit> {
     const body = parseJsonRecord(await bodyText(requestInput, init))
     if (!body || !Array.isArray(body.input)) {
       return fetchInitForReroute(requestInput, init, headers)
     }
 
-    const checkpoint = activeCheckpointByProvider.get(providerID)?.get(sessionID)
+    const checkpoint = selectedCheckpoint ?? activeCheckpointByProvider.get(providerID)?.get(sessionID)
     if (!checkpoint) return fetchInitForReroute(requestInput, init, headers)
 
     headers.set("content-type", "application/json")
@@ -1190,7 +1199,7 @@ export function createCompactHooks(
     const wrapped = (async (requestInput: RequestInfo | URL, init?: RequestInit) => {
       const url = urlOf(requestInput)
       const headers = requestHeaders(requestInput, init)
-      const { sessionID: headerSessionID, shouldCompact } = compactMarkers(headers, config)
+      const { sessionID: headerSessionID, shouldCompact, shouldNativeCompact } = compactMarkers(headers, config)
       const isResponsesRequest = url ? isResponsesUrl(url, config) : false
       const outboundHeaders = cleanedHeaders(headers, config)
 
@@ -1199,7 +1208,7 @@ export function createCompactHooks(
       }
 
       const sessionID = headerSessionID
-      if (shouldCompact && !sessionID) {
+      if ((shouldCompact || shouldNativeCompact) && !sessionID) {
         return new Response("OpenAI compact request is missing session header", { status: 400 })
       }
       if (shouldCompact && sessionID && blockedCompactionRequests.delete(sessionID)) {
@@ -1210,19 +1219,62 @@ export function createCompactHooks(
       const removeLatestUser =
         !shouldCompact && sessionID !== undefined && pendingAutoContinueRequests.get(sessionID) === providerID
       if (removeLatestUser) pendingAutoContinueRequests.delete(sessionID)
-      const requestInit = sessionID
-        ? await initWithCompactedInput(providerID, requestInput, init, outboundHeaders, sessionID, removeLatestUser)
-        : fetchInitForReroute(requestInput, init, outboundHeaders)
-      const openAIOAuthRequestInit = usesOpenAIOAuth(providerID, new Headers(requestInit.headers))
-        ? await openAIOAuth.requestInit(requestInit)
-        : undefined
-      const routedRequestInput = openAIOAuthRequestInit ? chatGPTCodexResponsesEndpoint : requestInput
-      const routedRequestInit = openAIOAuthRequestInit ?? requestInit
+      const nativeCompaction = sessionID ? pendingNativeCompactions.get(sessionID) : undefined
+      const matchingNativeCompaction = nativeCompaction?.providerID === providerID ? nativeCompaction : undefined
+      let originalRequestInit = fetchInitForReroute(requestInput, init, outboundHeaders)
+      if (shouldNativeCompact) {
+        const originalBody = await bodyText(requestInput, init)
+        if (originalBody !== undefined) originalRequestInit = { ...originalRequestInit, body: originalBody }
+      }
+      const suppressInvalidCheckpoint = !!matchingNativeCompaction && !shouldNativeCompact
+      const requestInit =
+        sessionID && !suppressInvalidCheckpoint && (!shouldNativeCompact || matchingNativeCompaction)
+          ? await initWithCompactedInput(
+              providerID,
+              requestInput,
+              init,
+              outboundHeaders,
+              sessionID,
+              removeLatestUser,
+              shouldNativeCompact ? matchingNativeCompaction?.checkpoint : undefined,
+            )
+          : originalRequestInit
+      const route = async (request: RequestInit) => {
+        const authRequest = usesOpenAIOAuth(providerID, new Headers(request.headers))
+          ? await openAIOAuth.requestInit(request)
+          : undefined
+        return {
+          input: authRequest ? chatGPTCodexResponsesEndpoint : requestInput,
+          init: authRequest ?? request,
+        }
+      }
+      const routed = await route(requestInit)
+      const routedRequestInput = routed.input
+      const routedRequestInit = routed.init
       if (!sessionID) {
         return baseFetch(routedRequestInput, routedRequestInit)
       }
 
       const body = parseJsonRecord(typeof routedRequestInit.body === "string" ? routedRequestInit.body : undefined)
+      if (shouldNativeCompact) {
+        const response = await baseFetch(routedRequestInput, routedRequestInit)
+        if (response.ok) {
+          if (matchingNativeCompaction) matchingNativeCompaction.completed = true
+          return response
+        }
+        if (
+          !matchingNativeCompaction ||
+          (response.status !== 400 && response.status !== 413 && response.status !== 422)
+        ) {
+          return response
+        }
+
+        const retry = await route(originalRequestInit)
+        const retriedResponse = await baseFetch(retry.input, retry.init)
+        if (!retriedResponse.ok) return response
+        matchingNativeCompaction.completed = true
+        return retriedResponse
+      }
       if (!shouldCompact) {
         rememberStableInstructions(providerID, sessionID, body)
         return baseFetch(routedRequestInput, routedRequestInit)
@@ -1321,6 +1373,23 @@ export function createCompactHooks(
   }
 
   async function handleEvent(event: AnyRecord) {
+    if (event.type === "session.compacted") {
+      const sessionID = asRecord(event.properties)?.sessionID
+      if (typeof sessionID !== "string") return
+      const nativeCompaction = pendingNativeCompactions.get(sessionID)
+      if (!nativeCompaction?.completed) return
+
+      pendingNativeCompactions.delete(sessionID)
+      for (const sessions of checkpointsByProvider.values()) sessions.delete(sessionID)
+      for (const sessions of activeCheckpointByProvider.values()) sessions.delete(sessionID)
+      for (const sessions of controlMessagesByProvider.values()) sessions.delete(sessionID)
+      pendingCompactResults.delete(sessionID)
+      pendingCompactionBoundaries.delete(sessionID)
+      clearStructuredCapture(sessionID)
+      store.deleteSession(sessionID)
+      return
+    }
+
     if (event.type === "session.deleted") {
       const sessionID = asRecord(event.properties)?.sessionID
       if (typeof sessionID !== "string") return
@@ -1329,6 +1398,7 @@ export function createCompactHooks(
       pendingCompactionBoundaries.delete(sessionID)
       pendingAutoContinues.delete(sessionID)
       pendingAutoContinueRequests.delete(sessionID)
+      pendingNativeCompactions.delete(sessionID)
       for (const sessions of activeCheckpointByProvider.values()) sessions.delete(sessionID)
       for (const sessions of controlMessagesByProvider.values()) sessions.delete(sessionID)
       for (const sessions of stableInstructionsByProvider.values()) sessions.delete(sessionID)
@@ -1438,6 +1508,18 @@ export function createCompactHooks(
       if (!providerID || !configuredProviders.has(providerID)) return
       if (typeof input.sessionID !== "string") return
 
+      const hasCompactionCapture =
+        !!structuredCompactionSnapshots.get(input.sessionID)?.length || failedCompactionCaptures.has(input.sessionID)
+      const checkpoint = activeCheckpointByProvider.get(providerID)?.get(input.sessionID)
+      if (hasCompactionCapture && checkpoint && hasInvalidCheckpointHistory(checkpoint)) {
+        pendingSystemByProvider.get(providerID)?.delete(input.sessionID)
+        pendingNativeCompactions.set(input.sessionID, { providerID, checkpoint, completed: false })
+        clearStructuredCapture(input.sessionID)
+        output.headers[config.headers.session] = input.sessionID
+        output.headers[config.headers.compact] = "native"
+        return
+      }
+
       if (structuredCompactionSnapshots.get(input.sessionID)?.length) {
         pendingSystemByProvider.get(providerID)?.delete(input.sessionID)
         const message = asRecord(input.message)
@@ -1543,6 +1625,7 @@ export function createCompactHooks(
       if (typeof input.sessionID !== "string") return
       pendingAutoContinues.delete(input.sessionID)
       pendingAutoContinueRequests.delete(input.sessionID)
+      pendingNativeCompactions.delete(input.sessionID)
       failedCompactionCaptures.delete(input.sessionID)
       blockedCompactionRequests.delete(input.sessionID)
       pendingCompactionCaptures.set(input.sessionID, (pendingCompactionCaptures.get(input.sessionID) ?? 0) + 1)

@@ -20,6 +20,21 @@ function compactResponse(payload: any) {
 
 const compactionInstructions = "You are an anchored context summarization assistant for coding sessions."
 const currentModel = "gpt-current"
+const embeddedOpenCodeHistory = [
+  "Here is the conversation so far:",
+  "<conversation>",
+  "[User]: preserved history",
+  "[Assistant]: preserved response",
+  "</conversation>",
+  "Here is the summary of the conversation before the <conversation> above:",
+].join("\n\n")
+
+function invalidCheckpointItems() {
+  return [
+    { role: "user", content: embeddedOpenCodeHistory },
+    { type: "compaction", encrypted_content: "invalid-checkpoint" },
+  ]
+}
 
 describe("OpenAI compact hooks", () => {
   test("defaults to following the conversation model and reasoning effort", () => {
@@ -735,6 +750,250 @@ describe("OpenAI compact hooks", () => {
       expect(await response.text()).toContain("could not be captured safely")
       expect(calls).toEqual([])
       expect(store.count()).toBe(0)
+    } finally {
+      store.close()
+    }
+  })
+
+  test("uses native compaction for an invalid checkpoint, clears its session state, then resumes plugin compaction", async () => {
+    const store = CheckpointStore.openMemory()
+    const calls: Array<{ init?: RequestInit }> = []
+    let callCount = 0
+    const fakeFetch = (async (_requestInput: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ init })
+      callCount++
+      if (callCount === 2) return new Response("checkpoint rejected", { status: 422 })
+      if (callCount === 3) return new Response("native summary", { status: 200 })
+      if (jsonBody(init).input?.at(-1)?.type === "compaction_trigger") {
+        return compactResponse({
+          id: "resp_after_native",
+          model: currentModel,
+          created_at: 1,
+          output: [{ type: "compaction", encrypted_content: "healthy-checkpoint" }],
+        })
+      }
+      return new Response("ok")
+    }) as typeof fetch
+    const sessionID = "ses_invalid_checkpoint_native_fallback"
+    const now = Date.now()
+    store.upsert(sessionID, {
+      providerID: "openai",
+      responseID: "resp_invalid_checkpoint",
+      afterMessageID: "msg_invalid_checkpoint",
+      afterCreatedAt: now,
+      createdAt: now,
+      items: invalidCheckpointItems(),
+    })
+    store.upsertControlMessage({
+      providerID: "openai",
+      sessionID,
+      messageID: "msg_old_control",
+      createdAt: now,
+      contentText: "old control",
+    })
+
+    try {
+      const hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+      const cfg: any = {}
+      await hooks.config?.(cfg)
+
+      await cfg.provider.openai.options.fetch("https://api.openai.com/v1/responses", {
+        method: "POST",
+        headers: { [defaultConfig.headers.session]: sessionID },
+        body: JSON.stringify({ model: currentModel, input: [{ role: "user", content: "before checkpoint check" }] }),
+      })
+      expect(jsonBody(calls[0]?.init).input).toEqual([{ role: "user", content: "before checkpoint check" }])
+
+      await hooks["experimental.session.compacting"]?.(
+        { sessionID } as any,
+        { context: [], prompt: undefined },
+      )
+      await hooks["experimental.chat.messages.transform"]?.(
+        { model: { providerID: "openai" } } as any,
+        {
+          messages: [
+            {
+              info: { id: "msg_invalid_checkpoint", sessionID, role: "user", time: { created: now } },
+              parts: [{ type: "compaction" }],
+            },
+            {
+              info: {
+                id: "msg_invalid_summary",
+                sessionID,
+                role: "assistant",
+                parentID: "msg_invalid_checkpoint",
+                summary: true,
+                time: { created: now + 1 },
+              },
+              parts: [{ type: "text", text: defaultConfig.summary }],
+            },
+            {
+              info: {
+                id: "msg_native_tail",
+                sessionID,
+                role: "user",
+                model: { providerID: "openai", modelID: currentModel },
+                time: { created: now + 2 },
+              },
+              parts: [{ type: "text", text: "tail for native summary" }],
+            },
+          ],
+        } as any,
+      )
+      const nativeHeaders = { headers: {} as Record<string, string> }
+      await hooks["chat.headers"]?.(
+        {
+          sessionID,
+          agent: "renamed-compaction-agent",
+          model: { providerID: "openai" },
+          message: { id: "msg_native_compaction", time: { created: now + 3 }, agent: "build" },
+        } as any,
+        nativeHeaders,
+      )
+      expect(nativeHeaders.headers[defaultConfig.headers.compact]).toBe("native")
+
+      const nativeBody = {
+        model: currentModel,
+        instructions: compactionInstructions,
+        input: [{ role: "user", content: "OpenCode native compaction request" }],
+      }
+      const nativeResponse = await cfg.provider.openai.options.fetch("https://api.openai.com/v1/responses", {
+        method: "POST",
+        headers: nativeHeaders.headers,
+        body: JSON.stringify(nativeBody),
+      })
+
+      expect(await nativeResponse.text()).toBe("native summary")
+      expect(jsonBody(calls[1]?.init).input).toEqual([
+        ...invalidCheckpointItems(),
+        { role: "user", content: "OpenCode native compaction request" },
+      ])
+      expect(jsonBody(calls[2]?.init)).toEqual(nativeBody)
+      expect(store.count()).toBe(1)
+      expect(store.loadControlMessages()).toHaveLength(1)
+
+      await hooks.event?.({ event: { type: "session.compacted", properties: { sessionID } } as any })
+      expect(store.count()).toBe(0)
+      expect(store.loadControlMessages()).toEqual([])
+
+      await cfg.provider.openai.options.fetch("https://api.openai.com/v1/responses", {
+        method: "POST",
+        headers: { [defaultConfig.headers.session]: sessionID },
+        body: JSON.stringify({ model: currentModel, input: [{ role: "user", content: "after native compaction" }] }),
+      })
+      expect(jsonBody(calls[3]?.init).input).toEqual([{ role: "user", content: "after native compaction" }])
+
+      await hooks["experimental.session.compacting"]?.(
+        { sessionID } as any,
+        { context: [], prompt: undefined },
+      )
+      await hooks["experimental.chat.messages.transform"]?.(
+        { model: { providerID: "openai" } } as any,
+        {
+          messages: [
+            {
+              info: {
+                id: "msg_healthy_history",
+                sessionID,
+                role: "user",
+                model: { providerID: "openai", modelID: currentModel },
+                time: { created: now + 4 },
+              },
+              parts: [{ type: "text", text: "healthy history" }],
+            },
+          ],
+        } as any,
+      )
+      const pluginHeaders = { headers: {} as Record<string, string> }
+      await hooks["chat.headers"]?.(
+        {
+          sessionID,
+          agent: "renamed-compaction-agent",
+          model: { providerID: "openai" },
+          message: { id: "msg_plugin_compaction", time: { created: now + 5 }, agent: "build" },
+        } as any,
+        pluginHeaders,
+      )
+      expect(pluginHeaders.headers[defaultConfig.headers.compact]).toBe("1")
+
+      await cfg.provider.openai.options.fetch("https://api.openai.com/v1/responses", {
+        method: "POST",
+        headers: pluginHeaders.headers,
+        body: JSON.stringify({ model: currentModel, instructions: compactionInstructions, input: [] }),
+      })
+      expect(store.loadAll().map((entry) => entry.checkpoint.responseID)).toEqual(["resp_after_native"])
+    } finally {
+      store.close()
+    }
+  })
+
+  test("keeps session state when native fallback and its checkpoint-free retry both fail", async () => {
+    const store = CheckpointStore.openMemory()
+    const calls: Array<{ init?: RequestInit }> = []
+    const fakeFetch = (async (_requestInput: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ init })
+      return calls.length === 1
+        ? new Response("checkpoint rejected", { status: 400 })
+        : new Response("native failed", { status: 500 })
+    }) as typeof fetch
+    const sessionID = "ses_failed_native_fallback"
+    const now = Date.now()
+    store.upsert(sessionID, {
+      providerID: "openai",
+      responseID: "resp_failed_native",
+      afterMessageID: "msg_failed_native",
+      afterCreatedAt: now,
+      createdAt: now,
+      items: invalidCheckpointItems(),
+    })
+    store.upsertControlMessage({
+      providerID: "openai",
+      sessionID,
+      messageID: "msg_failed_control",
+      createdAt: now,
+      contentText: "failed control",
+    })
+
+    try {
+      const hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+      const cfg: any = {}
+      await hooks.config?.(cfg)
+      await hooks["experimental.session.compacting"]?.(
+        { sessionID } as any,
+        { context: [], prompt: undefined },
+      )
+      await hooks["experimental.chat.messages.transform"]?.(
+        { model: { providerID: "openai" } } as any,
+        {
+          messages: [
+            {
+              info: { id: "msg_failed_native", sessionID, role: "user", time: { created: now } },
+              parts: [{ type: "compaction" }],
+            },
+          ],
+        } as any,
+      )
+      const headers = { headers: {} as Record<string, string> }
+      await hooks["chat.headers"]?.(
+        {
+          sessionID,
+          agent: "compaction",
+          model: { providerID: "openai" },
+          message: { id: "msg_retry_failure", time: { created: now + 1 }, agent: "build" },
+        } as any,
+        headers,
+      )
+      const response = await cfg.provider.openai.options.fetch("https://api.openai.com/v1/responses", {
+        method: "POST",
+        headers: headers.headers,
+        body: JSON.stringify({ model: currentModel, input: [{ role: "user", content: "native request" }] }),
+      })
+
+      expect(response.status).toBe(400)
+      expect(calls).toHaveLength(2)
+      await hooks.event?.({ event: { type: "session.compacted", properties: { sessionID } } as any })
+      expect(store.count()).toBe(1)
+      expect(store.loadControlMessages()).toHaveLength(1)
     } finally {
       store.close()
     }
