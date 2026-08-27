@@ -80,6 +80,7 @@ type StableInstructions = { instructions?: unknown; inputPrefix: unknown[] }
 type CompactHookOptions = {
   setOpenAIAuth?: (auth: OpenAIOAuthAuth) => Promise<void>
   tokenFetch?: OAuthFetchLike
+  getSessionMessages?: (sessionID: string) => Promise<unknown>
 }
 
 const wrappedFetch = "__opencodeOpenAICompactFetch"
@@ -233,6 +234,30 @@ function messageText(entry: MessageEntry) {
     .map((part) => part.text)
     .filter(Boolean)
     .join("\n")
+}
+
+function canonicalValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalValue)
+  const record = asRecord(value)
+  if (!record) return value
+  return Object.fromEntries(Object.keys(record).sort().map((key) => [key, canonicalValue(record[key])]))
+}
+
+function forkMessageFingerprint(entry: MessageEntry) {
+  const info = { ...(asRecord(entry.info) ?? {}) }
+  delete info.id
+  delete info.sessionID
+  delete info.parentID
+
+  const parts = (entry.parts ?? []).map((part) => {
+    const result = { ...(asRecord(part) ?? {}) }
+    delete result.id
+    delete result.messageID
+    delete result.sessionID
+    delete result.tail_start_id
+    return result
+  })
+  return JSON.stringify(canonicalValue({ info, parts }))
 }
 
 function isOpenCodeCompactionDeveloperPrompt(value: unknown) {
@@ -1021,6 +1046,114 @@ export function createCompactHooks(
     if (filtered.length !== messages.length) messages.splice(0, messages.length, ...filtered)
   }
 
+  // Transform history is compaction-filtered, so verify forks using raw source and child messages.
+  async function inheritForkState(providerID: string, sessionID: string, messages: MessageEntry[]) {
+    const getSessionMessages = options.getSessionMessages
+    if (!getSessionMessages) return
+    const providerSessions = checkpointsByProvider.get(providerID)
+    if (!providerSessions || providerSessions.has(sessionID)) return
+
+    const boundaryTimes = new Set<number>()
+    for (const message of messages) {
+      const createdAt = messageCreatedAt(message)
+      if (createdAt === undefined || !message.parts?.some((part) => part.type === "compaction")) continue
+      boundaryTimes.add(createdAt)
+    }
+    if (!boundaryTimes.size) return
+
+    const childValue = await getSessionMessages(sessionID).catch(() => undefined)
+    if (!Array.isArray(childValue)) return
+    const childMessages = childValue as MessageEntry[]
+    const childFingerprints = childMessages.map(forkMessageFingerprint)
+    const candidates = (
+      await Promise.all(
+        [...providerSessions.entries()].map(async ([sourceSessionID, checkpoints]) => {
+          if (sourceSessionID === sessionID || !checkpoints.some((item) => boundaryTimes.has(item.afterCreatedAt))) {
+            return undefined
+          }
+
+          const value = await getSessionMessages(sourceSessionID).catch(() => undefined)
+          if (!Array.isArray(value)) return undefined
+          const sourceMessages = value as MessageEntry[]
+          const limit = Math.min(sourceMessages.length, childMessages.length)
+          let prefixLength = 0
+          while (
+            prefixLength < limit &&
+            forkMessageFingerprint(sourceMessages[prefixLength]) === childFingerprints[prefixLength]
+          ) {
+            prefixLength++
+          }
+          if (!prefixLength) return undefined
+
+          const messageIDs = new Map<string, string>()
+          for (let index = 0; index < prefixLength; index++) {
+            const sourceMessageID = sourceMessages[index]?.info?.id
+            const childMessageID = childMessages[index]?.info?.id
+            if (typeof sourceMessageID === "string" && typeof childMessageID === "string") {
+              messageIDs.set(sourceMessageID, childMessageID)
+            }
+          }
+          const inherited = checkpoints.filter((checkpoint) => messageIDs.has(checkpoint.afterMessageID))
+          if (!inherited.length) return undefined
+
+          return {
+            sourceSessionID,
+            prefixLength,
+            messageIDs,
+            inherited,
+            signature: inherited
+              .map((checkpoint) => `${checkpoint.afterCreatedAt}\0${checkpoint.responseID}`)
+              .sort()
+              .join("\x01"),
+          }
+        }),
+      )
+    ).filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== undefined)
+    if (!candidates.length || providerSessions.has(sessionID)) return
+
+    const prefixLength = Math.max(...candidates.map((candidate) => candidate.prefixLength))
+    const finalists = candidates.filter((candidate) => candidate.prefixLength === prefixLength)
+    if (new Set(finalists.map((candidate) => candidate.signature)).size !== 1) return
+
+    const selected = finalists[0]
+    const inherited = selected.inherited.map((checkpoint) => ({
+      ...checkpoint,
+      afterMessageID: selected.messageIDs.get(checkpoint.afterMessageID)!,
+      items: structuredClone(checkpoint.items),
+    }))
+    providerSessions.set(sessionID, sortCheckpoints(inherited))
+    for (const checkpoint of inherited) store.upsert(sessionID, checkpoint)
+
+    const inheritedControls = new Map<string, ControlMessage>()
+    const conflictingControls = new Set<string>()
+    for (const candidate of finalists) {
+      for (const control of controlsFor(providerID, candidate.sourceSessionID)?.values() ?? []) {
+        const messageID = candidate.messageIDs.get(control.messageID)
+        if (!messageID || conflictingControls.has(messageID)) continue
+        const next = { ...control, sessionID, messageID }
+        const existing = inheritedControls.get(messageID)
+        if (
+          existing &&
+          (existing.createdAt !== next.createdAt || existing.contentText !== next.contentText)
+        ) {
+          inheritedControls.delete(messageID)
+          conflictingControls.add(messageID)
+          continue
+        }
+        inheritedControls.set(messageID, next)
+      }
+    }
+    for (const control of inheritedControls.values()) {
+      rememberControlIdentity(
+        control.providerID,
+        control.sessionID,
+        control.messageID,
+        control.createdAt,
+        control.contentText,
+      )
+    }
+  }
+
   for (const sessions of controlMessagesByProvider.values()) {
     for (const controls of sessions.values()) {
       for (const control of controls.values()) sanitizeCheckpointsForControl(control)
@@ -1588,6 +1721,7 @@ export function createCompactHooks(
       const pendingCaptures = sessionID ? pendingCompactionCaptures.get(sessionID) : undefined
       const providerID = transformProviderID(input, messages)
       if (sessionID && providerID && configuredProviders.has(providerID)) {
+        await inheritForkState(providerID, sessionID, messages)
         if (pendingCaptures && !activeCheckpointByProvider.get(providerID)?.has(sessionID)) {
           const checkpoint = checkpointsByProvider.get(providerID)?.get(sessionID)?.at(-1)
           if (checkpoint) getProviderSessionMap(activeCheckpointByProvider, providerID).set(sessionID, checkpoint)

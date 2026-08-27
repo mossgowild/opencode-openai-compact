@@ -101,6 +101,8 @@ Runtime checkpoints are stored in SQLite at:
 
 The database stores checkpoints and the message IDs of OpenCode's internal post-compaction control turns. Tracking IDs keeps those turns out of future requests even if OpenCode changes their text, metadata, or position.
 
+When a forked OpenCode session first runs after compaction, checkpoints and control turns before the fork point are copied to the new session with their regenerated message IDs.
+
 The default retention is 30 days. Checkpoints and control-message records are deleted when OpenCode emits `session.deleted`.
 
 ## Example Configuration

@@ -36,6 +36,148 @@ function invalidCheckpointItems() {
   ]
 }
 
+function forkHistory(sessionID: string, prefix: string, now: number) {
+  return [
+    {
+      info: { id: `${prefix}_start`, sessionID, role: "user", time: { created: now } },
+      parts: [{ id: `${prefix}_start_part`, messageID: `${prefix}_start`, sessionID, type: "text", text: "start" }],
+    },
+    {
+      info: {
+        id: `${prefix}_answer`,
+        sessionID,
+        role: "assistant",
+        parentID: `${prefix}_start`,
+        time: { created: now + 1 },
+      },
+      parts: [
+        { id: `${prefix}_answer_part`, messageID: `${prefix}_answer`, sessionID, type: "text", text: "answer" },
+      ],
+    },
+    {
+      info: { id: `${prefix}_checkpoint`, sessionID, role: "user", time: { created: now + 2 } },
+      parts: [
+        {
+          id: `${prefix}_checkpoint_part`,
+          messageID: `${prefix}_checkpoint`,
+          sessionID,
+          type: "compaction",
+          tail_start_id: `${prefix}_start`,
+        },
+      ],
+    },
+    {
+      info: {
+        id: `${prefix}_summary`,
+        sessionID,
+        role: "assistant",
+        parentID: `${prefix}_checkpoint`,
+        summary: true,
+        time: { created: now + 3 },
+      },
+      parts: [
+        {
+          id: `${prefix}_summary_part`,
+          messageID: `${prefix}_summary`,
+          sessionID,
+          type: "text",
+          text: defaultConfig.summary,
+        },
+      ],
+    },
+    {
+      info: { id: `${prefix}_control`, sessionID, role: "user", time: { created: now + 4 } },
+      parts: [
+        {
+          id: `${prefix}_control_part`,
+          messageID: `${prefix}_control`,
+          sessionID,
+          type: "text",
+          text: "markerless continuation",
+          synthetic: true,
+        },
+      ],
+    },
+    {
+      info: {
+        id: `${prefix}_continued`,
+        sessionID,
+        role: "assistant",
+        parentID: `${prefix}_control`,
+        time: { created: now + 5 },
+      },
+      parts: [
+        {
+          id: `${prefix}_continued_part`,
+          messageID: `${prefix}_continued`,
+          sessionID,
+          type: "text",
+          text: "continued work",
+        },
+      ],
+    },
+    {
+      info: {
+        id: `${prefix}_target`,
+        sessionID,
+        role: "user",
+        model: { providerID: "openai", modelID: currentModel },
+        time: { created: now + 6 },
+      },
+      parts: [{ id: `${prefix}_target_part`, messageID: `${prefix}_target`, sessionID, type: "text", text: "target" }],
+    },
+    {
+      info: {
+        id: `${prefix}_second_answer`,
+        sessionID,
+        role: "assistant",
+        parentID: `${prefix}_target`,
+        time: { created: now + 7 },
+      },
+      parts: [
+        {
+          id: `${prefix}_second_answer_part`,
+          messageID: `${prefix}_second_answer`,
+          sessionID,
+          type: "text",
+          text: "second answer",
+        },
+      ],
+    },
+    {
+      info: { id: `${prefix}_second_checkpoint`, sessionID, role: "user", time: { created: now + 8 } },
+      parts: [
+        {
+          id: `${prefix}_second_checkpoint_part`,
+          messageID: `${prefix}_second_checkpoint`,
+          sessionID,
+          type: "compaction",
+          tail_start_id: `${prefix}_target`,
+        },
+      ],
+    },
+    {
+      info: {
+        id: `${prefix}_second_summary`,
+        sessionID,
+        role: "assistant",
+        parentID: `${prefix}_second_checkpoint`,
+        summary: true,
+        time: { created: now + 9 },
+      },
+      parts: [
+        {
+          id: `${prefix}_second_summary_part`,
+          messageID: `${prefix}_second_summary`,
+          sessionID,
+          type: "text",
+          text: defaultConfig.summary,
+        },
+      ],
+    },
+  ]
+}
+
 describe("OpenAI compact hooks", () => {
   test("defaults to following the conversation model and reasoning effort", () => {
     expect(defaultConfig.providers.openai).toEqual({
@@ -994,6 +1136,350 @@ describe("OpenAI compact hooks", () => {
       await hooks.event?.({ event: { type: "session.compacted", properties: { sessionID } } as any })
       expect(store.count()).toBe(1)
       expect(store.loadControlMessages()).toHaveLength(1)
+    } finally {
+      store.close()
+    }
+  })
+
+  test("inherits only pre-fork checkpoints and controls, including across another fork and restart", async () => {
+    const store = CheckpointStore.openMemory()
+    const parentSessionID = "ses_fork_parent"
+    const childSessionID = "ses_fork_child"
+    const grandchildSessionID = "ses_fork_grandchild"
+    const now = Date.now()
+    const parentMessages = [
+      ...forkHistory(parentSessionID, "parent", now),
+      {
+        info: {
+          id: "parent_third_target",
+          sessionID: parentSessionID,
+          role: "user",
+          time: { created: now + 10 },
+        },
+        parts: [{ type: "text", text: "third target" }],
+      },
+      {
+        info: {
+          id: "parent_third_answer",
+          sessionID: parentSessionID,
+          role: "assistant",
+          parentID: "parent_third_target",
+          time: { created: now + 11 },
+        },
+        parts: [{ type: "text", text: "third answer" }],
+      },
+      {
+        info: {
+          id: "parent_third_checkpoint",
+          sessionID: parentSessionID,
+          role: "user",
+          time: { created: now + 12 },
+        },
+        parts: [{ type: "compaction" }],
+      },
+      {
+        info: {
+          id: "parent_third_summary",
+          sessionID: parentSessionID,
+          role: "assistant",
+          parentID: "parent_third_checkpoint",
+          summary: true,
+          time: { created: now + 13 },
+        },
+        parts: [{ type: "text", text: defaultConfig.summary }],
+      },
+    ]
+    const childMessages = [
+      ...forkHistory(childSessionID, "child", now),
+      {
+        info: {
+          id: "child_new_request",
+          sessionID: childSessionID,
+          role: "user",
+          model: { providerID: "openai", modelID: currentModel },
+          time: { created: now + 20 },
+        },
+        parts: [{ type: "text", text: "child request" }],
+      },
+    ]
+    const childTransformMessages = childMessages.slice(8)
+    const grandchildMessages = [
+      ...forkHistory(grandchildSessionID, "grandchild", now),
+      {
+        info: {
+          id: "grandchild_new_request",
+          sessionID: grandchildSessionID,
+          role: "user",
+          model: { providerID: "openai", modelID: currentModel },
+          time: { created: now + 30 },
+        },
+        parts: [{ type: "text", text: "grandchild request" }],
+      },
+    ]
+    const grandchildTransformMessages = grandchildMessages.slice(8)
+    store.upsert(parentSessionID, {
+      providerID: "openai",
+      responseID: "resp_parent_first",
+      afterMessageID: "parent_checkpoint",
+      afterCreatedAt: now + 2,
+      createdAt: now + 10,
+      items: [
+        { role: "user", content: "first checkpoint history" },
+        { type: "compaction", encrypted_content: "first checkpoint" },
+      ],
+    })
+    store.upsert(parentSessionID, {
+      providerID: "openai",
+      responseID: "resp_parent_second",
+      afterMessageID: "parent_second_checkpoint",
+      afterCreatedAt: now + 8,
+      createdAt: now + 11,
+      items: [
+        { role: "user", content: "second checkpoint history" },
+        { type: "compaction", encrypted_content: "second checkpoint" },
+      ],
+    })
+    store.upsert(parentSessionID, {
+      providerID: "openai",
+      responseID: "resp_parent_third",
+      afterMessageID: "parent_third_checkpoint",
+      afterCreatedAt: now + 12,
+      createdAt: now + 14,
+      items: [
+        { role: "user", content: "third checkpoint history" },
+        { type: "compaction", encrypted_content: "third checkpoint" },
+      ],
+    })
+    store.upsertControlMessage({
+      providerID: "openai",
+      sessionID: parentSessionID,
+      messageID: "parent_control",
+      createdAt: now + 4,
+      contentText: "markerless continuation",
+    })
+
+    const calls: Array<{ init?: RequestInit }> = []
+    const fakeFetch = (async (_requestInput: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ init })
+      return new Response("ok")
+    }) as typeof fetch
+    const sourceMessages = new Map<string, unknown>([
+      [parentSessionID, parentMessages],
+      [childSessionID, childMessages],
+      [grandchildSessionID, grandchildMessages],
+    ])
+
+    try {
+      const hooks = createCompactHooks(defaultConfig, store, fakeFetch, {
+        async getSessionMessages(sessionID) {
+          return sourceMessages.get(sessionID)
+        },
+      })
+      const cfg: any = {}
+      await hooks.config?.(cfg)
+      await hooks["experimental.chat.messages.transform"]?.(
+        { model: { providerID: "openai" } } as any,
+        { messages: childTransformMessages } as any,
+      )
+
+      expect(childTransformMessages.map((message) => message.info.id)).toEqual(["child_new_request"])
+      expect(
+        store
+          .loadAll()
+          .filter((entry) => entry.sessionID === childSessionID)
+          .map((entry) => ({ responseID: entry.checkpoint.responseID, afterMessageID: entry.checkpoint.afterMessageID })),
+      ).toEqual([
+        { responseID: "resp_parent_first", afterMessageID: "child_checkpoint" },
+        { responseID: "resp_parent_second", afterMessageID: "child_second_checkpoint" },
+      ])
+      expect(store.loadControlMessages().filter((entry) => entry.sessionID === childSessionID)).toEqual([
+        {
+          providerID: "openai",
+          sessionID: childSessionID,
+          messageID: "child_control",
+          createdAt: now + 4,
+          contentText: "markerless continuation",
+        },
+      ])
+
+      await cfg.provider.openai.options.fetch("https://api.openai.com/v1/responses", {
+        method: "POST",
+        headers: { [defaultConfig.headers.session]: childSessionID },
+        body: JSON.stringify({ model: currentModel, input: [{ role: "user", content: "child request" }] }),
+      })
+      expect(jsonBody(calls[0]?.init).input).toEqual([
+        { role: "user", content: "second checkpoint history" },
+        { type: "compaction", encrypted_content: "second checkpoint" },
+        { role: "user", content: "child request" },
+      ])
+
+      await hooks["experimental.chat.messages.transform"]?.(
+        { model: { providerID: "openai" } } as any,
+        { messages: grandchildTransformMessages } as any,
+      )
+      expect(
+        store
+          .loadAll()
+          .filter((entry) => entry.sessionID === grandchildSessionID)
+          .map((entry) => ({ responseID: entry.checkpoint.responseID, afterMessageID: entry.checkpoint.afterMessageID })),
+      ).toEqual([
+        { responseID: "resp_parent_first", afterMessageID: "grandchild_checkpoint" },
+        { responseID: "resp_parent_second", afterMessageID: "grandchild_second_checkpoint" },
+      ])
+      expect(store.loadControlMessages().filter((entry) => entry.sessionID === grandchildSessionID)).toEqual([
+        {
+          providerID: "openai",
+          sessionID: grandchildSessionID,
+          messageID: "grandchild_control",
+          createdAt: now + 4,
+          contentText: "markerless continuation",
+        },
+      ])
+
+      const restartCalls: Array<{ init?: RequestInit }> = []
+      const restartedHooks = createCompactHooks(
+        defaultConfig,
+        store,
+        (async (_requestInput: RequestInfo | URL, init?: RequestInit) => {
+          restartCalls.push({ init })
+          return new Response("ok")
+        }) as typeof fetch,
+      )
+      const restartedCfg: any = {}
+      await restartedHooks.config?.(restartedCfg)
+      const replayedGrandchildMessages = [
+        ...forkHistory(grandchildSessionID, "grandchild", now),
+        {
+          info: {
+            id: "grandchild_after_restart",
+            sessionID: grandchildSessionID,
+            role: "user",
+            model: { providerID: "openai", modelID: currentModel },
+            time: { created: now + 40 },
+          },
+          parts: [{ type: "text", text: "after restart" }],
+        },
+      ]
+      await restartedHooks["experimental.chat.messages.transform"]?.(
+        { model: { providerID: "openai" } } as any,
+        { messages: replayedGrandchildMessages } as any,
+      )
+      await restartedCfg.provider.openai.options.fetch("https://api.openai.com/v1/responses", {
+        method: "POST",
+        headers: { [defaultConfig.headers.session]: grandchildSessionID },
+        body: JSON.stringify({ model: currentModel, input: [{ role: "user", content: "after restart" }] }),
+      })
+      expect(jsonBody(restartCalls[0]?.init).input).toEqual([
+        { role: "user", content: "second checkpoint history" },
+        { type: "compaction", encrypted_content: "second checkpoint" },
+        { role: "user", content: "after restart" },
+      ])
+    } finally {
+      store.close()
+    }
+  })
+
+  test("does not inherit a checkpoint at or after the fork point", async () => {
+    const store = CheckpointStore.openMemory()
+    const parentSessionID = "ses_fork_before_checkpoint_parent"
+    const childSessionID = "ses_fork_before_checkpoint_child"
+    const now = Date.now()
+    const parentMessages = forkHistory(parentSessionID, "before_parent", now)
+    let messageReads = 0
+    store.upsert(parentSessionID, {
+      providerID: "openai",
+      responseID: "resp_after_fork",
+      afterMessageID: "before_parent_checkpoint",
+      afterCreatedAt: now + 2,
+      createdAt: now + 10,
+      items: [{ type: "compaction", encrypted_content: "after fork" }],
+    })
+
+    try {
+      const hooks = createCompactHooks(defaultConfig, store, fetch, {
+        async getSessionMessages() {
+          messageReads++
+          return parentMessages
+        },
+      })
+      const childMessages = [
+        ...forkHistory(childSessionID, "before_child", now).slice(0, 2),
+        {
+          info: {
+            id: "before_child_new",
+            sessionID: childSessionID,
+            role: "user",
+            model: { providerID: "openai", modelID: currentModel },
+            time: { created: now + 20 },
+          },
+          parts: [{ type: "text", text: "forked before checkpoint" }],
+        },
+      ]
+      await hooks["experimental.chat.messages.transform"]?.(
+        { model: { providerID: "openai" } } as any,
+        { messages: childMessages } as any,
+      )
+
+      expect(messageReads).toBe(0)
+      expect(store.loadAll().filter((entry) => entry.sessionID === childSessionID)).toEqual([])
+    } finally {
+      store.close()
+    }
+  })
+
+  test("does not inherit when matching fork sources disagree on the checkpoint", async () => {
+    const store = CheckpointStore.openMemory()
+    const firstParentID = "ses_ambiguous_parent_first"
+    const secondParentID = "ses_ambiguous_parent_second"
+    const childSessionID = "ses_ambiguous_child"
+    const now = Date.now()
+    const childMessages = [
+      ...forkHistory(childSessionID, "ambiguous_child", now).slice(0, 6),
+      {
+        info: {
+          id: "ambiguous_child_new",
+          sessionID: childSessionID,
+          role: "user",
+          model: { providerID: "openai", modelID: currentModel },
+          time: { created: now + 20 },
+        },
+        parts: [{ type: "text", text: "ambiguous fork" }],
+      },
+    ]
+    const sourceMessages = new Map<string, unknown>([
+      [firstParentID, forkHistory(firstParentID, "ambiguous_first", now)],
+      [secondParentID, forkHistory(secondParentID, "ambiguous_second", now)],
+      [childSessionID, childMessages],
+    ])
+    store.upsert(firstParentID, {
+      providerID: "openai",
+      responseID: "resp_ambiguous_first",
+      afterMessageID: "ambiguous_first_checkpoint",
+      afterCreatedAt: now + 2,
+      createdAt: now + 10,
+      items: [{ type: "compaction", encrypted_content: "first" }],
+    })
+    store.upsert(secondParentID, {
+      providerID: "openai",
+      responseID: "resp_ambiguous_second",
+      afterMessageID: "ambiguous_second_checkpoint",
+      afterCreatedAt: now + 2,
+      createdAt: now + 10,
+      items: [{ type: "compaction", encrypted_content: "second" }],
+    })
+
+    try {
+      const hooks = createCompactHooks(defaultConfig, store, fetch, {
+        async getSessionMessages(sessionID) {
+          return sourceMessages.get(sessionID)
+        },
+      })
+      await hooks["experimental.chat.messages.transform"]?.(
+        { model: { providerID: "openai" } } as any,
+        { messages: childMessages.slice(2) } as any,
+      )
+
+      expect(store.loadAll().filter((entry) => entry.sessionID === childSessionID)).toEqual([])
     } finally {
       store.close()
     }

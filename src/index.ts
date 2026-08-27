@@ -12,6 +12,10 @@ export const server: Plugin = async ({ client, directory, worktree }) => {
   store.prune(config.state.retentionDays)
 
   return createCompactHooks(config, store, fetch, {
+    async getSessionMessages(sessionID) {
+      const result = await client.session.messages({ path: { id: sessionID } })
+      return result.data
+    },
     async setOpenAIAuth(auth) {
       await client.auth.set({ path: { id: "openai" }, body: auth as any })
     },
