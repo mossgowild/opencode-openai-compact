@@ -523,6 +523,98 @@ describe("OpenAI compact hooks", () => {
     }
   })
 
+  test("reuses a persisted checkpoint when repeated compaction omits the prior boundary", async () => {
+    const store = CheckpointStore.openMemory()
+    const calls: Array<{ init?: RequestInit }> = []
+    const fakeFetch = (async (_requestInput: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ init })
+      return compactResponse({
+        id: "resp_repeated",
+        model: "gpt",
+        output: [{ type: "compaction", encrypted_content: "repeated" }],
+      })
+    }) as typeof fetch
+    const sessionID = "ses_repeated_without_boundary"
+    const now = Date.now()
+    store.upsert(sessionID, {
+      providerID: "openai",
+      responseID: "resp_previous",
+      afterMessageID: "msg_hidden_boundary",
+      afterCreatedAt: now,
+      createdAt: now,
+      items: [
+        { role: "user", content: "previous history" },
+        { type: "compaction", encrypted_content: "previous" },
+      ],
+    })
+    store.upsertControlMessage({
+      providerID: "openai",
+      sessionID,
+      messageID: "msg_old_continue",
+      createdAt: now + 1,
+      contentText: "old internal request",
+    })
+
+    try {
+      const hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+      const cfg: any = {}
+      await hooks.config?.(cfg)
+      await hooks["experimental.session.compacting"]?.(
+        { sessionID } as any,
+        { context: [], prompt: undefined },
+      )
+      await hooks["experimental.chat.messages.transform"]?.(
+        { model: { providerID: "openai" } } as any,
+        {
+          messages: [
+            {
+              info: { id: "msg_old_continue", sessionID, role: "user", time: { created: now + 1 } },
+              parts: [{ type: "text", text: "text and metadata changed" }],
+            },
+            {
+              info: {
+                id: "msg_tail",
+                sessionID,
+                role: "user",
+                model: { providerID: "openai", modelID: "gpt" },
+                time: { created: now + 2 },
+              },
+              parts: [{ type: "text", text: "retained tail" }],
+            },
+          ],
+        } as any,
+      )
+      const headers = { headers: {} as Record<string, string> }
+      await hooks["chat.headers"]?.(
+        {
+          sessionID,
+          agent: "another-internal-name",
+          model: { providerID: "openai" },
+          message: { id: "msg_new_compaction", time: { created: now + 3 }, agent: "build" },
+        } as any,
+        headers,
+      )
+      await cfg.provider.openai.options.fetch("https://proxy.test/openai/v1/responses", {
+        method: "POST",
+        headers: headers.headers,
+        body: JSON.stringify({
+          model: "ignored",
+          instructions: "Completely changed OpenCode compaction prompt.",
+          input: [{ role: "user", content: "Unknown flattened format." }],
+        }),
+      })
+
+      expect(jsonBody(calls[0]?.init).input).toEqual([
+        { role: "user", content: "previous history" },
+        { type: "compaction", encrypted_content: "previous" },
+        { role: "user", content: [{ type: "input_text", text: "retained tail" }] },
+        { type: "compaction_trigger" },
+      ])
+    } finally {
+      store.close()
+    }
+  })
+
   test("falls back to embedded history when structured messages cannot be cloned", async () => {
     const store = CheckpointStore.openMemory()
     const calls: Array<{ url: string; init?: RequestInit }> = []
@@ -590,6 +682,59 @@ describe("OpenAI compact hooks", () => {
         stream: true,
         include: ["reasoning.encrypted_content"],
       })
+    } finally {
+      store.close()
+    }
+  })
+
+  test("fails closed when a captured compaction transaction cannot clone its history", async () => {
+    const store = CheckpointStore.openMemory()
+    const calls: Array<{ init?: RequestInit }> = []
+    const fakeFetch = (async (_requestInput: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ init })
+      return new Response("must not be called")
+    }) as typeof fetch
+    const sessionID = "ses_failed_transaction_capture"
+
+    try {
+      const hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+      const cfg: any = {}
+      await hooks.config?.(cfg)
+      await hooks["experimental.session.compacting"]?.(
+        { sessionID } as any,
+        { context: [], prompt: undefined },
+      )
+      await hooks["experimental.chat.messages.transform"]?.(
+        { model: { providerID: "openai" } } as any,
+        {
+          messages: [
+            {
+              info: { id: "msg_uncloneable", sessionID, role: "user" },
+              parts: [{ type: "text", text: "history", metadata: { uncloneable: () => undefined } }],
+            },
+          ],
+        } as any,
+      )
+      const headers = { headers: {} as Record<string, string> }
+      await hooks["chat.headers"]?.(
+        {
+          sessionID,
+          agent: "changed-compaction-agent",
+          model: { providerID: "openai" },
+          message: { id: "msg_compaction", time: { created: Date.now() }, agent: "build" },
+        } as any,
+        headers,
+      )
+      const response = await cfg.provider.openai.options.fetch("https://proxy.test/openai/v1/responses", {
+        method: "POST",
+        headers: headers.headers,
+        body: JSON.stringify({ model: "gpt", input: [{ role: "user", content: "changed prompt" }] }),
+      })
+
+      expect(response.status).toBe(502)
+      expect(await response.text()).toContain("could not be captured safely")
+      expect(calls).toEqual([])
+      expect(store.count()).toBe(0)
     } finally {
       store.close()
     }
@@ -840,9 +985,44 @@ describe("OpenAI compact hooks", () => {
         { sessionID: "ses_rendered", model: { providerID: "openai" } } as any,
         { system: ["You are an anchored context summarization assistant for coding sessions.\n\nSummarize only..."] },
       )
+      await hooks["experimental.session.compacting"]?.(
+        { sessionID: "ses_rendered" } as any,
+        { context: [], prompt: undefined },
+      )
+      await hooks["experimental.chat.messages.transform"]?.(
+        { model: { providerID: "openai" } } as any,
+        {
+          messages: [
+            {
+              info: {
+                id: "msg_rendered_user",
+                sessionID: "ses_rendered",
+                role: "user",
+                model: { providerID: "openai", modelID: "gpt" },
+              },
+              parts: [{ type: "text", text: "hello" }],
+            },
+            {
+              info: {
+                id: "msg_rendered_assistant",
+                sessionID: "ses_rendered",
+                role: "assistant",
+                providerID: "openai",
+                modelID: "gpt",
+              },
+              parts: [{ type: "text", text: "done" }],
+            },
+          ],
+        } as any,
+      )
       const compactHeaders = { headers: {} as Record<string, string> }
       await hooks["chat.headers"]?.(
-        { sessionID: "ses_rendered", agent: "compaction", model: { providerID: "openai" } } as any,
+        {
+          sessionID: "ses_rendered",
+          agent: "renamed-internal-agent",
+          model: { providerID: "openai" },
+          message: { id: "msg_compaction", time: { created: 3 }, agent: "build" },
+        } as any,
         compactHeaders,
       )
 
@@ -866,10 +1046,10 @@ describe("OpenAI compact hooks", () => {
 
       expect(calls[0]?.url).toBe("https://proxy.test/openai/v1/responses")
       expect(jsonBody(calls[0]?.init)).toEqual({
-        model: "ignored",
+        model: "gpt",
         instructions: "You are OpenCode.\n \nAGENTS instructions",
         input: [
-          { role: "user", content: "hello" },
+          { role: "user", content: [{ type: "input_text", text: "hello" }] },
           { role: "assistant", content: [{ type: "output_text", text: "done" }] },
           { type: "compaction_trigger" },
         ],
@@ -1161,6 +1341,360 @@ describe("OpenAI compact hooks", () => {
     }
   })
 
+  test("tracks auto-continue by message id and removes it across later turns and plugin restarts", async () => {
+    const store = CheckpointStore.openMemory()
+    const calls: Array<{ init?: RequestInit }> = []
+    const fakeFetch = (async (_requestInput: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ init })
+      return new Response("ok")
+    }) as typeof fetch
+    const sessionID = "ses_control_message"
+    const controlText = "A future OpenCode version may use completely different continuation text."
+    const startedAt = Date.now()
+
+    store.upsert(sessionID, {
+      providerID: "openai",
+      responseID: "resp_control",
+      afterMessageID: "msg_compaction_boundary",
+      afterCreatedAt: startedAt,
+      createdAt: startedAt,
+      items: [
+        { role: "user", content: "before compaction" },
+        { role: "user", content: [{ type: "input_text", text: controlText }] },
+        { type: "compaction", encrypted_content: "checkpoint" },
+      ],
+    })
+
+    try {
+      const hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+      const cfg: any = {}
+      await hooks.config?.(cfg)
+
+      await hooks["experimental.compaction.autocontinue"]?.(
+        {
+          sessionID,
+          model: { providerID: "openai" },
+          message: { id: "msg_compaction_boundary", time: { created: startedAt } },
+        } as any,
+        { enabled: true },
+      )
+
+      const firstContinuation = [
+        {
+          info: { id: "msg_compaction_boundary", sessionID, role: "user", time: { created: startedAt } },
+          parts: [{ type: "compaction" }],
+        },
+        {
+          info: {
+            id: "msg_summary",
+            sessionID,
+            role: "assistant",
+            parentID: "msg_compaction_boundary",
+            summary: true,
+            time: { created: startedAt + 1 },
+          },
+          parts: [{ type: "text", text: "A changed summary placeholder." }],
+        },
+        {
+          info: { id: "msg_internal_continue", sessionID, role: "user", time: { created: startedAt + 2 } },
+          parts: [{ type: "text", text: controlText, synthetic: true }],
+        },
+      ]
+      await hooks["experimental.chat.messages.transform"]?.(
+        { model: { providerID: "openai" } } as any,
+        { messages: firstContinuation } as any,
+      )
+      expect(firstContinuation).toEqual([])
+      expect(store.loadControlMessages().map((entry) => entry.messageID)).toEqual(["msg_internal_continue"])
+      expect(store.loadAll()[0]?.checkpoint.items).toEqual([
+        { role: "user", content: "before compaction" },
+        { type: "compaction", encrypted_content: "checkpoint" },
+      ])
+
+      const laterMessages = [
+        {
+          info: { id: "msg_compaction_boundary", sessionID, role: "user", time: { created: startedAt } },
+          parts: [{ type: "compaction" }],
+        },
+        {
+          info: {
+            id: "msg_summary",
+            sessionID,
+            role: "assistant",
+            parentID: "msg_compaction_boundary",
+            summary: true,
+            time: { created: startedAt + 1 },
+          },
+          parts: [{ type: "text", text: "A changed summary placeholder." }],
+        },
+        {
+          info: { id: "msg_internal_continue", sessionID, role: "user", time: { created: startedAt + 2 } },
+          parts: [{ type: "text", text: controlText }],
+        },
+        {
+          info: {
+            id: "msg_continued_assistant",
+            sessionID,
+            role: "assistant",
+            providerID: "openai",
+            modelID: "gpt",
+            time: { created: startedAt + 3 },
+          },
+          parts: [{ type: "text", text: "continued work" }],
+        },
+        {
+          info: {
+            id: "msg_real_user",
+            sessionID,
+            role: "user",
+            model: { providerID: "openai", modelID: "gpt" },
+            time: { created: startedAt + 4 },
+          },
+          parts: [{ type: "text", text: controlText }],
+        },
+      ]
+      await hooks["experimental.chat.messages.transform"]?.(
+        { model: { providerID: "openai" } } as any,
+        { messages: laterMessages } as any,
+      )
+      expect(laterMessages.map((message) => message.info.id)).toEqual(["msg_continued_assistant", "msg_real_user"])
+
+      await cfg.provider.openai.options.fetch("https://proxy.test/openai/v1/responses", {
+        method: "POST",
+        headers: { [defaultConfig.headers.session]: sessionID },
+        body: JSON.stringify({
+          model: "gpt",
+          input: [
+            { role: "assistant", content: [{ type: "output_text", text: "continued work" }] },
+            { role: "user", content: controlText },
+          ],
+        }),
+      })
+      expect(jsonBody(calls[0]?.init).input).toEqual([
+        { role: "user", content: "before compaction" },
+        { type: "compaction", encrypted_content: "checkpoint" },
+        { role: "assistant", content: [{ type: "output_text", text: "continued work" }] },
+        { role: "user", content: controlText },
+      ])
+
+      const restartedHooks = createCompactHooks(defaultConfig, store, fakeFetch)
+      const afterRestart = [
+        {
+          info: { id: "msg_compaction_boundary", sessionID, role: "user", time: { created: startedAt } },
+          parts: [{ type: "compaction" }],
+        },
+        {
+          info: {
+            id: "msg_summary",
+            sessionID,
+            role: "assistant",
+            parentID: "msg_compaction_boundary",
+            summary: true,
+            time: { created: startedAt + 1 },
+          },
+          parts: [{ type: "text", text: "A changed summary placeholder." }],
+        },
+        {
+          info: { id: "msg_internal_continue", sessionID, role: "user", time: { created: startedAt + 2 } },
+          parts: [{ type: "text", text: "metadata and text can both change later" }],
+        },
+        {
+          info: { id: "msg_after_restart", sessionID, role: "user", time: { created: startedAt + 5 } },
+          parts: [{ type: "text", text: "real request" }],
+        },
+      ]
+      await restartedHooks["experimental.chat.messages.transform"]?.(
+        { model: { providerID: "openai" } } as any,
+        { messages: afterRestart } as any,
+      )
+      expect(afterRestart.map((message) => message.info.id)).toEqual(["msg_after_restart"])
+    } finally {
+      store.close()
+    }
+  })
+
+  test("does not classify the newest real user when pending first observes an older marked continuation", async () => {
+    const store = CheckpointStore.openMemory()
+    const sessionID = "ses_pending_with_real_user"
+    const now = Date.now()
+    try {
+      const hooks = createCompactHooks(defaultConfig, store)
+      await hooks["experimental.compaction.autocontinue"]?.(
+        {
+          sessionID,
+          agent: "plan",
+          model: { providerID: "openai" },
+          message: { id: "msg_compaction", time: { created: now } },
+        } as any,
+        { enabled: true },
+      )
+
+      const messages = [
+        {
+          info: { id: "msg_internal_continue", sessionID, role: "user", agent: "plan", time: { created: now + 1 } },
+          parts: [
+            {
+              type: "text",
+              text: "changed internal continuation",
+              synthetic: true,
+              metadata: { compaction_continue: true },
+            },
+          ],
+        },
+        {
+          info: { id: "msg_real_user", sessionID, role: "user", agent: "plan", time: { created: now + 2 } },
+          parts: [{ type: "text", text: "real user request" }],
+        },
+      ]
+      await hooks["experimental.chat.messages.transform"]?.(
+        { model: { providerID: "openai" } } as any,
+        { messages } as any,
+      )
+
+      expect(messages.map((message) => message.info.id)).toEqual(["msg_real_user"])
+      expect(store.loadControlMessages().map((message) => message.messageID)).toEqual(["msg_internal_continue"])
+    } finally {
+      store.close()
+    }
+  })
+
+  test("uses chat.message as proof that a pending message is real user input", async () => {
+    const store = CheckpointStore.openMemory()
+    const sessionID = "ses_real_user_proof"
+    const now = Date.now()
+    try {
+      const hooks = createCompactHooks(defaultConfig, store)
+      await hooks["experimental.compaction.autocontinue"]?.(
+        {
+          sessionID,
+          agent: "plan",
+          model: { providerID: "openai" },
+          message: { id: "msg_compaction", time: { created: now } },
+        } as any,
+        { enabled: true },
+      )
+      await hooks["chat.message"]?.(
+        { sessionID, agent: "plan", model: { providerID: "openai", modelID: "gpt" }, messageID: "msg_real" } as any,
+        {
+          message: { id: "msg_real", role: "user", agent: "plan" },
+          parts: [{ type: "text", text: "real request" }],
+        } as any,
+      )
+      const messages = [
+        {
+          info: { id: "msg_real", sessionID, role: "user", agent: "plan", time: { created: now + 1 } },
+          parts: [{ type: "text", text: "real request" }],
+        },
+      ]
+      await hooks["experimental.chat.messages.transform"]?.(
+        { model: { providerID: "openai" } } as any,
+        { messages } as any,
+      )
+
+      expect(messages.map((message) => message.info.id)).toEqual(["msg_real"])
+      expect(store.loadControlMessages()).toEqual([])
+    } finally {
+      store.close()
+    }
+  })
+
+  test("captures markerless auto-continue from chat headers and removes its request user item", async () => {
+    const store = CheckpointStore.openMemory()
+    const calls: Array<{ init?: RequestInit }> = []
+    const fakeFetch = (async (_requestInput: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ init })
+      return new Response("ok")
+    }) as typeof fetch
+    const sessionID = "ses_header_auto_continue"
+    const now = Date.now() - 60_000
+    const continuationCreatedAt = Date.now()
+    store.upsert(sessionID, {
+      providerID: "openai",
+      responseID: "resp_header_auto_continue",
+      afterMessageID: "msg_compaction",
+      afterCreatedAt: now,
+      createdAt: now,
+      items: [
+        { role: "user", content: "checkpoint history" },
+        { type: "compaction", encrypted_content: "checkpoint" },
+      ],
+    })
+
+    try {
+      const hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+      const cfg: any = {}
+      await hooks.config?.(cfg)
+      await hooks["experimental.compaction.autocontinue"]?.(
+        {
+          sessionID,
+          agent: "plan",
+          model: { providerID: "openai" },
+          message: { id: "msg_compaction", time: { created: now } },
+        } as any,
+        { enabled: true },
+      )
+      const messages = [
+        {
+          info: { id: "msg_compaction", sessionID, role: "user", agent: "plan", time: { created: now } },
+          parts: [{ type: "compaction" }],
+        },
+        {
+          info: {
+            id: "msg_summary",
+            sessionID,
+            role: "assistant",
+            parentID: "msg_compaction",
+            summary: true,
+            time: { created: now + 1 },
+          },
+          parts: [{ type: "text", text: "summary" }],
+        },
+      ]
+      await hooks["experimental.chat.messages.transform"]?.(
+        { model: { providerID: "openai" } } as any,
+        { messages } as any,
+      )
+      const headers = { headers: {} as Record<string, string> }
+      await hooks["chat.headers"]?.(
+        {
+          sessionID,
+          agent: "plan",
+          model: { providerID: "openai" },
+          message: { id: "msg_markerless_continue", time: { created: continuationCreatedAt }, agent: "plan" },
+        } as any,
+        headers,
+      )
+      await cfg.provider.openai.options.fetch("https://proxy.test/openai/v1/responses", {
+        method: "POST",
+        headers: headers.headers,
+        body: JSON.stringify({
+          model: "gpt",
+          input: [
+            { role: "user", content: "retained tail" },
+            { role: "user", content: "markerless internal continuation" },
+          ],
+        }),
+      })
+
+      expect(jsonBody(calls[0]?.init).input).toEqual([
+        { role: "user", content: "checkpoint history" },
+        { type: "compaction", encrypted_content: "checkpoint" },
+        { role: "user", content: "retained tail" },
+      ])
+      expect(store.loadControlMessages()).toEqual([
+        {
+          providerID: "openai",
+          sessionID,
+          messageID: "msg_markerless_continue",
+          createdAt: continuationCreatedAt,
+          contentText: "",
+        },
+      ])
+    } finally {
+      store.close()
+    }
+  })
+
   test("keeps checkpoints through undo and redo until undo removes the boundary", async () => {
     const store = CheckpointStore.openMemory()
     const calls: Array<{ url: string; init?: RequestInit }> = []
@@ -1374,14 +1908,40 @@ describe("OpenAI compact hooks", () => {
     }
   })
 
-  test("adds compaction headers only for OpenAI compaction agent", async () => {
+  test("adds compaction headers from the captured transaction without relying on the agent name", async () => {
     const store = CheckpointStore.openMemory()
     try {
       const hooks = createCompactHooks(defaultConfig, store)
       const output = { headers: {} as Record<string, string> }
 
+      await hooks["experimental.session.compacting"]?.(
+        { sessionID: "ses" } as any,
+        { context: [], prompt: undefined },
+      )
+      await hooks["experimental.chat.messages.transform"]?.(
+        { model: { providerID: "openai" } } as any,
+        {
+          messages: [
+            {
+              info: {
+                id: "msg_user",
+                sessionID: "ses",
+                role: "user",
+                model: { providerID: "openai", modelID: "gpt" },
+              },
+              parts: [{ type: "text", text: "history" }],
+            },
+          ],
+        } as any,
+      )
+
       await hooks["chat.headers"]?.(
-        { model: { providerID: "openai" }, sessionID: "ses", agent: "compaction" } as any,
+        {
+          model: { providerID: "openai" },
+          sessionID: "ses",
+          agent: "renamed-internal-agent",
+          message: { id: "msg_compaction", time: { created: 2 }, agent: "build" },
+        } as any,
         output,
       )
 

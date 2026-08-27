@@ -23,7 +23,23 @@ type CheckpointRow = {
   items_json: string
 }
 
-const schemaVersion = 1
+type ControlMessageRow = {
+  provider_id: string
+  session_id: string
+  message_id: string
+  created_at: number
+  content_text: string
+}
+
+export type ControlMessage = {
+  providerID: string
+  sessionID: string
+  messageID: string
+  createdAt: number
+  contentText: string
+}
+
+const schemaVersion = 2
 const dayMs = 24 * 60 * 60 * 1000
 
 function asRecord(value: unknown): AnyRecord | undefined {
@@ -132,8 +148,40 @@ export class CheckpointStore {
       )
   }
 
+  loadControlMessages() {
+    return this.db
+      .query<ControlMessageRow>(
+        `select provider_id, session_id, message_id, created_at, content_text
+         from control_messages
+         order by provider_id, session_id, created_at, message_id`,
+      )
+      .all()
+      .map(
+        (row): ControlMessage => ({
+          providerID: row.provider_id,
+          sessionID: row.session_id,
+          messageID: row.message_id,
+          createdAt: row.created_at,
+          contentText: row.content_text,
+        }),
+      )
+  }
+
+  upsertControlMessage(message: ControlMessage) {
+    this.db
+      .query(
+        `insert into control_messages (provider_id, session_id, message_id, created_at, content_text)
+         values (?, ?, ?, ?, ?)
+         on conflict(provider_id, session_id, message_id) do update set
+           created_at = excluded.created_at,
+           content_text = excluded.content_text`,
+      )
+      .run(message.providerID, message.sessionID, message.messageID, message.createdAt, message.contentText)
+  }
+
   deleteSession(sessionID: string) {
     this.db.query("delete from checkpoints where session_id = ?").run(sessionID)
+    this.db.query("delete from control_messages where session_id = ?").run(sessionID)
   }
 
   deleteCheckpoint(sessionID: string, providerID: string, responseID: string) {
@@ -142,9 +190,24 @@ export class CheckpointStore {
       .run(sessionID, providerID, responseID)
   }
 
+  deleteControlMessage(sessionID: string, messageID: string) {
+    this.db.query("delete from control_messages where session_id = ? and message_id = ?").run(sessionID, messageID)
+  }
+
   prune(retentionDays: number) {
     const cutoff = Date.now() - retentionDays * dayMs
     this.db.query("delete from checkpoints where created_at < ?").run(cutoff)
+    this.db
+      .query(
+        `delete from control_messages
+         where created_at < ?
+           and not exists (
+             select 1 from checkpoints
+             where checkpoints.provider_id = control_messages.provider_id
+               and checkpoints.session_id = control_messages.session_id
+           )`,
+      )
+      .run(cutoff)
   }
 
   count() {
@@ -177,6 +240,37 @@ export class CheckpointStore {
 
         create index if not exists checkpoints_provider_session_boundary_idx
         on checkpoints (provider_id, session_id, after_created_at, created_at);
+
+        create table if not exists control_messages (
+          provider_id text not null,
+          session_id text not null,
+          message_id text not null,
+          created_at integer not null,
+          content_text text not null,
+          primary key (provider_id, session_id, message_id)
+        );
+
+        create index if not exists control_messages_session_created_idx
+        on control_messages (session_id, created_at);
+
+        PRAGMA user_version = ${schemaVersion};
+      `)
+      return
+    }
+
+    if (version === 1) {
+      this.db.exec(`
+        create table if not exists control_messages (
+          provider_id text not null,
+          session_id text not null,
+          message_id text not null,
+          created_at integer not null,
+          content_text text not null,
+          primary key (provider_id, session_id, message_id)
+        );
+
+        create index if not exists control_messages_session_created_idx
+        on control_messages (session_id, created_at);
 
         PRAGMA user_version = ${schemaVersion};
       `)

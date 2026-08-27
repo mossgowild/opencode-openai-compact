@@ -14,7 +14,13 @@ import {
   type OpenAIOAuthAuth,
   type OAuthFetchLike,
 } from "./oauth.js"
-import { CheckpointStore, compactedItemsFrom, type AnyRecord, type Checkpoint } from "./state.js"
+import {
+  CheckpointStore,
+  compactedItemsFrom,
+  type AnyRecord,
+  type Checkpoint,
+  type ControlMessage,
+} from "./state.js"
 
 export { compactedItemsFrom } from "./state.js"
 
@@ -27,6 +33,9 @@ type MessageEntry = {
     providerID?: string
     modelID?: string
     variant?: string
+    agent?: string
+    parentID?: string
+    summary?: boolean
     model?: {
       providerID?: string
       modelID?: string
@@ -53,6 +62,12 @@ type MessageEntry = {
 }
 type MessageBoundary = { messageID: string; createdAt: number }
 type PendingCompactResult = { providerID: string; responseID: string; items: AnyRecord[] }
+type PendingAutoContinue = {
+  providerID: string
+  agent?: string
+  compactionMessageID?: string
+  compactionCreatedAt?: number
+}
 type ConversationSettings = {
   providerID: string
   modelID: string
@@ -205,6 +220,14 @@ function contentText(value: unknown): string {
       const record = asRecord(item)
       return typeof record?.text === "string" ? record.text : ""
     })
+    .filter(Boolean)
+    .join("\n")
+}
+
+function messageText(entry: MessageEntry) {
+  return (entry.parts ?? [])
+    .filter((part) => part.type === "text" && !part.ignored && typeof part.text === "string")
+    .map((part) => part.text)
     .filter(Boolean)
     .join("\n")
 }
@@ -439,6 +462,15 @@ function postCompactionInput(input: unknown[], summary: string) {
   const result = [...input.slice(0, leadingInstructionCount(input)), ...input.slice(start + 2)]
   if (messageHasText(result.at(-1), "user", openCodeCompactionContinuation)) result.pop()
   return result
+}
+
+function withoutLatestUserInput(input: unknown[]) {
+  for (let index = input.length - 1; index >= 0; index--) {
+    if (asRecord(input[index])?.role === "user") {
+      return [...input.slice(0, index), ...input.slice(index + 1)]
+    }
+  }
+  return input
 }
 
 function compactBodyValue(key: string, value: unknown) {
@@ -786,12 +818,24 @@ export function createCompactHooks(
     checkpoints.push(checkpoint)
     sessions.set(sessionID, sortCheckpoints(checkpoints))
   }
+  const controlMessagesByProvider = new Map<string, Map<string, Map<string, ControlMessage>>>()
+  for (const control of store.loadControlMessages()) {
+    const sessions = getProviderSessionMap(controlMessagesByProvider, control.providerID)
+    const messages = sessions.get(control.sessionID) ?? new Map<string, ControlMessage>()
+    messages.set(control.messageID, control)
+    sessions.set(control.sessionID, messages)
+  }
   const pendingCompactResults = new Map<string, PendingCompactResult>()
+  const pendingCompactionBoundaries = new Map<string, MessageBoundary>()
+  const pendingAutoContinues = new Map<string, PendingAutoContinue>()
+  const pendingAutoContinueRequests = new Map<string, string>()
   const activeCheckpointByProvider = new Map<string, Map<string, Checkpoint>>()
   const stableInstructionsByProvider = new Map<string, Map<string, StableInstructions>>()
   const pendingSystemByProvider = new Map<string, Map<string, string>>()
   const providerByMessage = new Map<string, string>()
   const pendingCompactionCaptures = new Map<string, number>()
+  const failedCompactionCaptures = new Set<string>()
+  const blockedCompactionRequests = new Set<string>()
   const structuredCompactionSnapshots = new Map<string, StructuredCompactionSnapshot[]>()
   let openAIAuth: OpenAIOAuthAuth | undefined
   let openAIWrappedFetch: FetchLike | undefined
@@ -853,6 +897,126 @@ export function createCompactHooks(
 
   function transformProviderID(input: unknown, messages: MessageEntry[]) {
     return getProviderID(input) ?? providerIDFromMessages(messages) ?? providerIDFromTrimmedSessionCheckpoint(messages)
+  }
+
+  function controlsFor(providerID: string, sessionID: string) {
+    return controlMessagesByProvider.get(providerID)?.get(sessionID)
+  }
+
+  function removeControlItem(items: AnyRecord[], text: string) {
+    const matches = items
+      .map((item, index) => (item.role === "user" && contentText(item.content) === text ? index : -1))
+      .filter((index) => index !== -1)
+    if (matches.length !== 1) return items
+    return items.filter((_, index) => index !== matches[0])
+  }
+
+  function sanitizeCheckpointsForControl(control: ControlMessage) {
+    if (!control.contentText) return
+    const checkpoints = checkpointsByProvider.get(control.providerID)?.get(control.sessionID)
+    for (const checkpoint of checkpoints ?? []) {
+      const items = removeControlItem(checkpoint.items, control.contentText)
+      if (items.length === checkpoint.items.length) continue
+      checkpoint.items = items
+      store.upsert(control.sessionID, checkpoint)
+    }
+  }
+
+  function rememberControlIdentity(
+    providerID: string,
+    sessionID: string,
+    messageID: string,
+    createdAt: number,
+    contentText: string,
+  ) {
+    const sessions = getProviderSessionMap(controlMessagesByProvider, providerID)
+    const messages = sessions.get(sessionID) ?? new Map<string, ControlMessage>()
+    const existing = messages.get(messageID)
+    if (existing) {
+      if (existing.contentText || !contentText) return
+      const updated = { ...existing, contentText }
+      messages.set(messageID, updated)
+      store.upsertControlMessage(updated)
+      sanitizeCheckpointsForControl(updated)
+      return
+    }
+
+    const control: ControlMessage = {
+      providerID,
+      sessionID,
+      messageID,
+      createdAt,
+      contentText,
+    }
+    messages.set(messageID, control)
+    sessions.set(sessionID, messages)
+    store.upsertControlMessage(control)
+    sanitizeCheckpointsForControl(control)
+  }
+
+  function rememberControlMessage(providerID: string, sessionID: string, message: MessageEntry) {
+    const messageID = message.info?.id
+    if (typeof messageID !== "string") return
+    rememberControlIdentity(
+      providerID,
+      sessionID,
+      messageID,
+      messageCreatedAt(message) ?? Date.now(),
+      messageText(message),
+    )
+  }
+
+  function forgetControlMessage(sessionID: string, messageID: string) {
+    for (const sessions of controlMessagesByProvider.values()) {
+      const controls = sessions.get(sessionID)
+      if (!controls?.delete(messageID)) continue
+      if (!controls.size) sessions.delete(sessionID)
+    }
+    store.deleteControlMessage(sessionID, messageID)
+  }
+
+  function isPendingAutoContinueCandidate(message: MessageEntry, pending: PendingAutoContinue) {
+    const info = message.info
+    if (info?.role !== "user" || typeof info.id !== "string" || info.id === pending.compactionMessageID) return false
+    if (pending.agent && info.agent && pending.agent !== info.agent) return false
+    const createdAt = messageCreatedAt(message)
+    if (
+      createdAt !== undefined &&
+      pending.compactionCreatedAt !== undefined &&
+      createdAt < pending.compactionCreatedAt
+    ) {
+      return false
+    }
+    return message.parts?.some((part) => part.type === "text" && part.synthetic === true) === true
+  }
+
+  function captureControlMessages(providerID: string, sessionID: string, messages: MessageEntry[]) {
+    for (const message of messages) {
+      if (isOpenCodeCompactionContinuation(message)) rememberControlMessage(providerID, sessionID, message)
+    }
+
+    const pending = pendingAutoContinues.get(sessionID)
+    if (pending?.providerID !== providerID) return
+    const continuation = messages.find((message) => isPendingAutoContinueCandidate(message, pending))
+    if (!continuation) return
+    rememberControlMessage(providerID, sessionID, continuation)
+    pendingAutoContinues.delete(sessionID)
+  }
+
+  function removeControlMessages(providerID: string, sessionID: string, messages: MessageEntry[]) {
+    const controls = controlsFor(providerID, sessionID)
+    if (!controls?.size) return
+    const filtered = messages.filter((message) => {
+      const messageID = message.info?.id
+      return typeof messageID !== "string" || !controls.has(messageID)
+    })
+    if (filtered.length !== messages.length) messages.splice(0, messages.length, ...filtered)
+  }
+
+  for (const sessions of controlMessagesByProvider.values()) {
+    for (const controls of sessions.values()) {
+      for (const control of controls.values()) sanitizeCheckpointsForControl(control)
+    }
   }
 
   function storeStableInstructions(providerID: string, sessionID: string, stable: StableInstructions) {
@@ -940,7 +1104,20 @@ export function createCompactHooks(
     const index = messages.findIndex((message) => message.info?.id === checkpoint.afterMessageID)
     if (index === -1) return
 
-    const trimmed = messages.slice(index + 1).filter((message) => !isOpenCodeCompactionContinuation(message))
+    let start = index + 1
+    const boundary = messages[index]
+    if (boundary?.info?.role === "user" && boundary.parts?.some((part) => part.type === "compaction")) {
+      const summaryIndex = messages.findIndex(
+        (message, messageIndex) =>
+          messageIndex > index &&
+          message.info?.role === "assistant" &&
+          message.info.summary === true &&
+          message.info.parentID === boundary.info?.id,
+      )
+      if (summaryIndex !== -1) start = summaryIndex + 1
+    }
+
+    const trimmed = messages.slice(start).filter((message) => !isOpenCodeCompactionContinuation(message))
     messages.splice(0, messages.length, ...trimmed)
   }
 
@@ -954,6 +1131,9 @@ export function createCompactHooks(
   function clearStructuredCapture(sessionID: string) {
     pendingCompactionCaptures.delete(sessionID)
     structuredCompactionSnapshots.delete(sessionID)
+    failedCompactionCaptures.delete(sessionID)
+    blockedCompactionRequests.delete(sessionID)
+    pendingCompactionBoundaries.delete(sessionID)
   }
 
   function structuredInputFor(
@@ -983,6 +1163,7 @@ export function createCompactHooks(
     init: RequestInit | undefined,
     headers: Headers,
     sessionID: string,
+    removeLatestUser: boolean,
   ): Promise<RequestInit> {
     const body = parseJsonRecord(await bodyText(requestInput, init))
     if (!body || !Array.isArray(body.input)) {
@@ -993,7 +1174,8 @@ export function createCompactHooks(
     if (!checkpoint) return fetchInitForReroute(requestInput, init, headers)
 
     headers.set("content-type", "application/json")
-    const input = postCompactionInput(body.input, config.summary)
+    const postCompaction = postCompactionInput(body.input, config.summary)
+    const input = removeLatestUser ? withoutLatestUserInput(postCompaction) : postCompaction
     const next = {
       ...body,
       input: [...structuredClone(checkpoint.items), ...input],
@@ -1020,9 +1202,16 @@ export function createCompactHooks(
       if (shouldCompact && !sessionID) {
         return new Response("OpenAI compact request is missing session header", { status: 400 })
       }
+      if (shouldCompact && sessionID && blockedCompactionRequests.delete(sessionID)) {
+        clearStructuredCapture(sessionID)
+        return new Response("OpenAI compact structured history could not be captured safely", { status: 502 })
+      }
 
+      const removeLatestUser =
+        !shouldCompact && sessionID !== undefined && pendingAutoContinueRequests.get(sessionID) === providerID
+      if (removeLatestUser) pendingAutoContinueRequests.delete(sessionID)
       const requestInit = sessionID
-        ? await initWithCompactedInput(providerID, requestInput, init, outboundHeaders, sessionID)
+        ? await initWithCompactedInput(providerID, requestInput, init, outboundHeaders, sessionID, removeLatestUser)
         : fetchInitForReroute(requestInput, init, outboundHeaders)
       const openAIOAuthRequestInit = usesOpenAIOAuth(providerID, new Headers(requestInit.headers))
         ? await openAIOAuth.requestInit(requestInit)
@@ -1053,6 +1242,10 @@ export function createCompactHooks(
         compactReasoningEffort(asRecord(body.reasoning)?.effort) ??
         null
       const structuredInput = structuredInputFor(providerID, sessionID, selectedModel, snapshot)
+      if (snapshot && !structuredInput) {
+        clearStructuredCapture(sessionID)
+        return new Response("OpenAI compact structured history could not be converted safely", { status: 502 })
+      }
       if (!structuredInput) clearStructuredCapture(sessionID)
       if (!structuredInput && !isKnownOpenCodeCompactionBody(body)) {
         return baseFetch(routedRequestInput, routedRequestInit)
@@ -1075,6 +1268,7 @@ export function createCompactHooks(
         body: JSON.stringify(compactRequestBody),
       })
       if (!compacted.ok) {
+        clearStructuredCapture(sessionID)
         return compacted
       }
 
@@ -1082,23 +1276,28 @@ export function createCompactHooks(
       const compaction = asRecord(payload?.compaction)
       const items = compaction ? compactedItemsForV2(compactRequestBody.input, compaction) : undefined
       if (!items) {
+        clearStructuredCapture(sessionID)
         return new Response("OpenAI compact response stream must complete with exactly one valid compaction item", {
           status: 502,
         })
       }
       const responseID = typeof payload?.id === "string" ? payload.id : undefined
       if (!responseID) {
+        clearStructuredCapture(sessionID)
         return new Response("OpenAI compact response.completed event must contain a response id", { status: 502 })
       }
 
+      const capturedBoundary = pendingCompactionBoundaries.get(sessionID)
+      pendingCompactionBoundaries.delete(sessionID)
       const checkpoint = addCheckpoint(
         providerID,
         sessionID,
         responseID,
-        { messageID: responseMessageID(responseID), createdAt: Date.now() },
+        capturedBoundary ?? { messageID: responseMessageID(responseID), createdAt: Date.now() },
         items,
       )
-      pendingCompactResults.set(sessionID, { providerID, responseID, items })
+      if (capturedBoundary) pendingCompactResults.delete(sessionID)
+      else pendingCompactResults.set(sessionID, { providerID, responseID, items })
       getProviderSessionMap(activeCheckpointByProvider, providerID).set(sessionID, checkpoint)
       return sseResponse({
         responseID,
@@ -1127,7 +1326,11 @@ export function createCompactHooks(
       if (typeof sessionID !== "string") return
       for (const sessions of checkpointsByProvider.values()) sessions.delete(sessionID)
       pendingCompactResults.delete(sessionID)
+      pendingCompactionBoundaries.delete(sessionID)
+      pendingAutoContinues.delete(sessionID)
+      pendingAutoContinueRequests.delete(sessionID)
       for (const sessions of activeCheckpointByProvider.values()) sessions.delete(sessionID)
+      for (const sessions of controlMessagesByProvider.values()) sessions.delete(sessionID)
       for (const sessions of stableInstructionsByProvider.values()) sessions.delete(sessionID)
       for (const sessions of pendingSystemByProvider.values()) sessions.delete(sessionID)
       clearStructuredCapture(sessionID)
@@ -1146,6 +1349,10 @@ export function createCompactHooks(
 
       providerByMessage.delete(messageProviderKey(sessionID, messageID))
       clearStructuredCapture(sessionID)
+      pendingAutoContinues.delete(sessionID)
+      pendingAutoContinueRequests.delete(sessionID)
+      failedCompactionCaptures.delete(sessionID)
+      forgetControlMessage(sessionID, messageID)
       for (const [providerID, sessions] of checkpointsByProvider) {
         const checkpoints = sessions.get(sessionID)
         if (!checkpoints) continue
@@ -1216,6 +1423,13 @@ export function createCompactHooks(
     },
 
     "chat.message": async (input, output) => {
+      if (typeof input.sessionID === "string") {
+        pendingAutoContinues.delete(input.sessionID)
+        pendingAutoContinueRequests.delete(input.sessionID)
+        const message = asRecord(output.message)
+        const messageID = typeof input.messageID === "string" ? input.messageID : message?.id
+        if (typeof messageID === "string") forgetControlMessage(input.sessionID, messageID)
+      }
       rememberMessageProvider(input, output)
     },
 
@@ -1224,14 +1438,60 @@ export function createCompactHooks(
       if (!providerID || !configuredProviders.has(providerID)) return
       if (typeof input.sessionID !== "string") return
 
-      if (input.agent === "compaction") {
+      if (structuredCompactionSnapshots.get(input.sessionID)?.length) {
         pendingSystemByProvider.get(providerID)?.delete(input.sessionID)
+        const message = asRecord(input.message)
+        const messageID = message?.id
+        const createdAt = asRecord(message?.time)?.created
+        if (typeof messageID === "string" && finiteNumber(createdAt)) {
+          pendingCompactionBoundaries.set(input.sessionID, { messageID, createdAt })
+        }
         output.headers[config.headers.session] = input.sessionID
         output.headers[config.headers.compact] = "1"
         return
       }
 
-      if (utilityAgents.has(input.agent)) {
+      if (failedCompactionCaptures.has(input.sessionID)) {
+        pendingSystemByProvider.get(providerID)?.delete(input.sessionID)
+        blockedCompactionRequests.add(input.sessionID)
+        output.headers[config.headers.session] = input.sessionID
+        output.headers[config.headers.compact] = "1"
+        return
+      }
+
+      const pendingAutoContinue = pendingAutoContinues.get(input.sessionID)
+      if (pendingAutoContinue?.providerID === providerID) {
+        const message = asRecord(input.message)
+        const messageID = message?.id
+        const createdAt = asRecord(message?.time)?.created
+        const createdAfterCompaction =
+          !finiteNumber(createdAt) ||
+          pendingAutoContinue.compactionCreatedAt === undefined ||
+          createdAt >= pendingAutoContinue.compactionCreatedAt
+        const matchingAgent = !pendingAutoContinue.agent || pendingAutoContinue.agent === input.agent
+        if (
+          createdAfterCompaction &&
+          matchingAgent &&
+          typeof messageID === "string" &&
+          messageID !== pendingAutoContinue.compactionMessageID
+        ) {
+          rememberControlIdentity(
+            providerID,
+            input.sessionID,
+            messageID,
+            finiteNumber(createdAt) ? createdAt : Date.now(),
+            "",
+          )
+          pendingAutoContinueRequests.set(input.sessionID, providerID)
+          pendingAutoContinues.delete(input.sessionID)
+        }
+      }
+
+      const messageAgent = asRecord(input.message)?.agent
+      if (
+        (typeof messageAgent === "string" && messageAgent !== input.agent) ||
+        (messageAgent === undefined && utilityAgents.has(input.agent))
+      ) {
         pendingSystemByProvider.get(providerID)?.delete(input.sessionID)
         return
       }
@@ -1244,17 +1504,31 @@ export function createCompactHooks(
       const messages = output.messages as unknown as MessageEntry[]
       const sessionID = sessionIDFromMessages(messages)
       const pendingCaptures = sessionID ? pendingCompactionCaptures.get(sessionID) : undefined
-      const snapshot = pendingCaptures
-        ? { messages: cloneMessages(messages), conversation: conversationSettingsFrom(messages) }
-        : undefined
       const providerID = transformProviderID(input, messages)
+      if (sessionID && providerID && configuredProviders.has(providerID)) {
+        if (pendingCaptures && !activeCheckpointByProvider.get(providerID)?.has(sessionID)) {
+          const checkpoint = checkpointsByProvider.get(providerID)?.get(sessionID)?.at(-1)
+          if (checkpoint) getProviderSessionMap(activeCheckpointByProvider, providerID).set(sessionID, checkpoint)
+        }
+        captureControlMessages(providerID, sessionID, messages)
+        removeControlMessages(providerID, sessionID, messages)
+      }
+      const clonedMessages = pendingCaptures ? cloneMessages(messages) : undefined
+      const snapshot = clonedMessages
+        ? { messages: clonedMessages, conversation: conversationSettingsFrom(messages) }
+        : undefined
       if (providerID && configuredProviders.has(providerID)) trimMessagesAfterCheckpoint(providerID, messages)
-      if (sessionID && pendingCaptures && snapshot) {
+      if (sessionID && pendingCaptures) {
         if (pendingCaptures === 1) pendingCompactionCaptures.delete(sessionID)
         else pendingCompactionCaptures.set(sessionID, pendingCaptures - 1)
-        const snapshots = structuredCompactionSnapshots.get(sessionID) ?? []
-        snapshots.push(snapshot)
-        structuredCompactionSnapshots.set(sessionID, snapshots)
+        if (snapshot) {
+          failedCompactionCaptures.delete(sessionID)
+          const snapshots = structuredCompactionSnapshots.get(sessionID) ?? []
+          snapshots.push(snapshot)
+          structuredCompactionSnapshots.set(sessionID, snapshots)
+        } else {
+          failedCompactionCaptures.add(sessionID)
+        }
       }
     },
 
@@ -1267,7 +1541,43 @@ export function createCompactHooks(
 
     "experimental.session.compacting": async (input) => {
       if (typeof input.sessionID !== "string") return
+      pendingAutoContinues.delete(input.sessionID)
+      pendingAutoContinueRequests.delete(input.sessionID)
+      failedCompactionCaptures.delete(input.sessionID)
+      blockedCompactionRequests.delete(input.sessionID)
       pendingCompactionCaptures.set(input.sessionID, (pendingCompactionCaptures.get(input.sessionID) ?? 0) + 1)
+    },
+
+    "experimental.compaction.autocontinue": async (input) => {
+      if (typeof input.sessionID !== "string") return
+      const providerID = getProviderID(input)
+      if (!providerID || !configuredProviders.has(providerID)) return
+      const pending = pendingCompactResults.get(input.sessionID)
+      const message = asRecord(input.message)
+      const messageID = message?.id
+      const createdAt = asRecord(message?.time)?.created
+      if (
+        pending?.providerID === providerID &&
+        typeof messageID === "string" &&
+        finiteNumber(createdAt)
+      ) {
+        pendingCompactResults.delete(input.sessionID)
+        const checkpoint = addCheckpoint(
+          providerID,
+          input.sessionID,
+          pending.responseID,
+          { messageID, createdAt },
+          pending.items,
+        )
+        getProviderSessionMap(activeCheckpointByProvider, providerID).set(input.sessionID, checkpoint)
+      }
+      pendingAutoContinueRequests.delete(input.sessionID)
+      pendingAutoContinues.set(input.sessionID, {
+        providerID,
+        agent: typeof input.agent === "string" ? input.agent : undefined,
+        compactionMessageID: typeof messageID === "string" ? messageID : undefined,
+        compactionCreatedAt: finiteNumber(createdAt) ? createdAt : undefined,
+      })
     },
   }
 
