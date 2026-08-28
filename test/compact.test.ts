@@ -1484,6 +1484,108 @@ describe("OpenAI compact hooks", () => {
     }
   })
 
+  test("uses the previous checkpoint after removing a pending native fallback boundary", async () => {
+    const store = CheckpointStore.openMemory()
+    const calls: Array<{ init?: RequestInit }> = []
+    const fakeFetch = (async (_requestInput: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ init })
+      return new Response("ok")
+    }) as typeof fetch
+    const sessionID = "ses_native_boundary_removed"
+    const now = Date.now()
+    const oldItems = [
+      { role: "user", content: "older valid history" },
+      { type: "compaction", encrypted_content: "older-valid-checkpoint" },
+    ]
+    store.upsert(sessionID, {
+      providerID: "openai",
+      responseID: "resp_old_valid",
+      afterMessageID: "msg_old_checkpoint",
+      afterCreatedAt: now,
+      createdAt: now,
+      items: oldItems,
+    })
+    store.upsert(sessionID, {
+      providerID: "openai",
+      responseID: "resp_new_invalid",
+      afterMessageID: "msg_invalid_checkpoint",
+      afterCreatedAt: now + 10,
+      createdAt: now + 10,
+      items: invalidCheckpointItems(),
+    })
+
+    try {
+      const hooks = createCompactHooks(defaultConfig, store, fakeFetch)
+      const cfg: any = {}
+      await hooks.config?.(cfg)
+      await hooks["experimental.session.compacting"]?.(
+        { sessionID } as any,
+        { context: [], prompt: undefined },
+      )
+      await hooks["experimental.chat.messages.transform"]?.(
+        { model: { providerID: "openai" } } as any,
+        {
+          messages: [
+            {
+              info: {
+                id: "msg_invalid_checkpoint",
+                sessionID,
+                role: "user",
+                time: { created: now + 10 },
+              },
+              parts: [{ type: "compaction" }],
+            },
+          ],
+        } as any,
+      )
+      const headers = { headers: {} as Record<string, string> }
+      await hooks["chat.headers"]?.(
+        {
+          sessionID,
+          agent: "compaction",
+          model: { providerID: "openai" },
+          message: { id: "msg_native_attempt", time: { created: now + 11 } },
+        } as any,
+        headers,
+      )
+      expect(headers.headers[defaultConfig.headers.compact]).toBe("native")
+
+      await hooks.event?.({
+        event: {
+          type: "message.removed",
+          properties: { sessionID, messageID: "msg_invalid_checkpoint" },
+        } as any,
+      })
+      await hooks["experimental.chat.messages.transform"]?.(
+        { model: { providerID: "openai" } } as any,
+        {
+          messages: [
+            {
+              info: { id: "msg_old_checkpoint", sessionID, role: "user", time: { created: now } },
+              parts: [{ type: "compaction" }],
+            },
+            {
+              info: { id: "msg_after_undo", sessionID, role: "user", time: { created: now + 12 } },
+              parts: [{ type: "text", text: "after undo" }],
+            },
+          ],
+        } as any,
+      )
+      await cfg.provider.openai.options.fetch("https://api.openai.com/v1/responses", {
+        method: "POST",
+        headers: { [defaultConfig.headers.session]: sessionID },
+        body: JSON.stringify({ model: currentModel, input: [{ role: "user", content: "after undo" }] }),
+      })
+
+      expect(jsonBody(calls[0]?.init).input).toEqual([
+        ...oldItems,
+        { role: "user", content: "after undo" },
+      ])
+    } finally {
+      store.close()
+    }
+  })
+
   test("inherits only pre-fork checkpoints and controls, including across another fork and restart", async () => {
     const store = CheckpointStore.openMemory()
     const parentSessionID = "ses_fork_parent"

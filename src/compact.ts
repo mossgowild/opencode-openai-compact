@@ -1632,6 +1632,14 @@ export function createCompactHooks(
       pendingAutoContinues.delete(sessionID)
       pendingAutoContinueRequests.delete(sessionID)
       failedCompactionCaptures.delete(sessionID)
+      const nativeCompaction = pendingNativeCompactions.get(sessionID)
+      if (
+        nativeCompaction &&
+        (nativeCompaction.checkpoint.afterMessageID === messageID ||
+          nativeCompaction.compactionMessageID === messageID)
+      ) {
+        pendingNativeCompactions.delete(sessionID)
+      }
       forgetControlMessage(sessionID, messageID)
       for (const [providerID, sessions] of checkpointsByProvider) {
         const checkpoints = sessions.get(sessionID)
