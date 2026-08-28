@@ -1009,25 +1009,6 @@ export function createCompactHooks(
     return controlMessagesByProvider.get(providerID)?.get(sessionID)
   }
 
-  function removeControlItem(items: AnyRecord[], text: string) {
-    const matches = items
-      .map((item, index) => (item.role === "user" && contentText(item.content) === text ? index : -1))
-      .filter((index) => index !== -1)
-    if (matches.length !== 1) return items
-    return items.filter((_, index) => index !== matches[0])
-  }
-
-  function sanitizeCheckpointsForControl(control: ControlMessage) {
-    if (!control.contentText) return
-    const checkpoints = checkpointsByProvider.get(control.providerID)?.get(control.sessionID)
-    for (const checkpoint of checkpoints ?? []) {
-      const items = removeControlItem(checkpoint.items, control.contentText)
-      if (items.length === checkpoint.items.length) continue
-      checkpoint.items = items
-      store.upsert(control.sessionID, checkpoint)
-    }
-  }
-
   function rememberControlIdentity(
     providerID: string,
     sessionID: string,
@@ -1039,11 +1020,11 @@ export function createCompactHooks(
     const messages = sessions.get(sessionID) ?? new Map<string, ControlMessage>()
     const existing = messages.get(messageID)
     if (existing) {
+      // Text can match genuine user input, so message IDs remain the only removal identity.
       if (existing.contentText || !contentText) return
       const updated = { ...existing, contentText }
       messages.set(messageID, updated)
       store.upsertControlMessage(updated)
-      sanitizeCheckpointsForControl(updated)
       return
     }
 
@@ -1057,7 +1038,6 @@ export function createCompactHooks(
     messages.set(messageID, control)
     sessions.set(sessionID, messages)
     store.upsertControlMessage(control)
-    sanitizeCheckpointsForControl(control)
   }
 
   function rememberControlMessage(providerID: string, sessionID: string, message: MessageEntry) {
@@ -1224,12 +1204,6 @@ export function createCompactHooks(
         control.createdAt,
         control.contentText,
       )
-    }
-  }
-
-  for (const sessions of controlMessagesByProvider.values()) {
-    for (const controls of sessions.values()) {
-      for (const control of controls.values()) sanitizeCheckpointsForControl(control)
     }
   }
 

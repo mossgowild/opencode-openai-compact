@@ -2344,6 +2344,43 @@ describe("OpenAI compact hooks", () => {
     }
   })
 
+  test("keeps real user checkpoint content when it matches a persisted control message", () => {
+    const store = CheckpointStore.openMemory()
+    const sessionID = "ses_control_text_collision"
+    const collisionText = "same text from a real user"
+    const now = Date.now()
+
+    store.upsertControlMessage({
+      providerID: "openai",
+      sessionID,
+      messageID: "msg_old_control",
+      createdAt: now,
+      contentText: collisionText,
+    })
+    store.upsert(sessionID, {
+      providerID: "openai",
+      responseID: "resp_after_real_user",
+      afterMessageID: "msg_checkpoint",
+      afterCreatedAt: now + 1,
+      createdAt: now + 1,
+      items: [
+        { role: "user", content: collisionText },
+        { type: "compaction", encrypted_content: "checkpoint" },
+      ],
+    })
+
+    try {
+      createCompactHooks(defaultConfig, store)
+
+      expect(store.loadAll()[0]?.checkpoint.items).toEqual([
+        { role: "user", content: collisionText },
+        { type: "compaction", encrypted_content: "checkpoint" },
+      ])
+    } finally {
+      store.close()
+    }
+  })
+
   test("tracks auto-continue by message id and removes it across later turns and plugin restarts", async () => {
     const store = CheckpointStore.openMemory()
     const calls: Array<{ init?: RequestInit }> = []
@@ -2363,7 +2400,6 @@ describe("OpenAI compact hooks", () => {
       createdAt: startedAt,
       items: [
         { role: "user", content: "before compaction" },
-        { role: "user", content: [{ type: "input_text", text: controlText }] },
         { type: "compaction", encrypted_content: "checkpoint" },
       ],
     })
