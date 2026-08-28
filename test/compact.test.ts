@@ -1022,6 +1022,25 @@ describe("OpenAI compact hooks", () => {
           properties: {
             sessionID,
             info: {
+              id: "msg_unrelated_summary",
+              sessionID,
+              role: "assistant",
+              parentID: "msg_another_compaction",
+              summary: true,
+              finish: "stop",
+              time: { created: now + 4, completed: now + 5 },
+            },
+          },
+        } as any,
+      })
+      expect(store.count()).toBe(1)
+
+      await hooks.event?.({
+        event: {
+          type: "message.updated",
+          properties: {
+            sessionID,
+            info: {
               id: "msg_native_summary",
               sessionID,
               role: "assistant",
@@ -1394,6 +1413,72 @@ describe("OpenAI compact hooks", () => {
       await hooks.event?.({ event: { type: "session.compacted", properties: { sessionID } } as any })
       expect(store.count()).toBe(1)
       expect(store.loadControlMessages()).toHaveLength(1)
+    } finally {
+      store.close()
+    }
+  })
+
+  test("keeps state when a completed summary arrives before native fallback succeeds", async () => {
+    const store = CheckpointStore.openMemory()
+    const sessionID = "ses_pending_native_summary"
+    const now = Date.now()
+    store.upsert(sessionID, {
+      providerID: "openai",
+      responseID: "resp_pending_native",
+      afterMessageID: "msg_invalid_checkpoint",
+      afterCreatedAt: now,
+      createdAt: now,
+      items: invalidCheckpointItems(),
+    })
+
+    try {
+      const hooks = createCompactHooks(defaultConfig, store)
+      await hooks["experimental.session.compacting"]?.(
+        { sessionID } as any,
+        { context: [], prompt: undefined },
+      )
+      await hooks["experimental.chat.messages.transform"]?.(
+        { model: { providerID: "openai" } } as any,
+        {
+          messages: [
+            {
+              info: { id: "msg_invalid_checkpoint", sessionID, role: "user", time: { created: now } },
+              parts: [{ type: "compaction" }],
+            },
+          ],
+        } as any,
+      )
+      const headers = { headers: {} as Record<string, string> }
+      await hooks["chat.headers"]?.(
+        {
+          sessionID,
+          agent: "compaction",
+          model: { providerID: "openai" },
+          message: { id: "msg_native_attempt", time: { created: now + 1 } },
+        } as any,
+        headers,
+      )
+      expect(headers.headers[defaultConfig.headers.compact]).toBe("native")
+
+      await hooks.event?.({
+        event: {
+          type: "message.updated",
+          properties: {
+            sessionID,
+            info: {
+              id: "msg_native_summary",
+              sessionID,
+              role: "assistant",
+              parentID: "msg_native_attempt",
+              summary: true,
+              finish: "stop",
+              time: { created: now + 2, completed: now + 3 },
+            },
+          },
+        } as any,
+      })
+
+      expect(store.count()).toBe(1)
     } finally {
       store.close()
     }

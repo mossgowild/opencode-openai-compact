@@ -69,7 +69,12 @@ type PendingAutoContinue = {
   compactionMessageID?: string
   compactionCreatedAt?: number
 }
-type PendingNativeCompaction = { providerID: string; checkpoint: Checkpoint; completed: boolean }
+type PendingNativeCompaction = {
+  providerID: string
+  checkpoint: Checkpoint
+  compactionMessageID?: string
+  completed: boolean
+}
 type ConversationSettings = {
   providerID: string
   modelID: string
@@ -1585,8 +1590,11 @@ export function createCompactHooks(
     if (event.type === "message.updated") {
       const properties = asRecord(event.properties)
       const sessionID = properties?.sessionID
-      if (typeof sessionID !== "string" || !pendingNativeCompactions.has(sessionID)) return
-      if (!isCompletedCompactionSummary(properties?.info)) return
+      if (typeof sessionID !== "string") return
+      const nativeCompaction = pendingNativeCompactions.get(sessionID)
+      const info = asRecord(properties?.info)
+      if (!nativeCompaction?.completed || !isCompletedCompactionSummary(info)) return
+      if (nativeCompaction.compactionMessageID && info?.parentID !== nativeCompaction.compactionMessageID) return
 
       clearNativeFallbackSession(sessionID)
       return
@@ -1715,7 +1723,13 @@ export function createCompactHooks(
       const checkpoint = activeCheckpointByProvider.get(providerID)?.get(input.sessionID)
       if (hasCompactionCapture && checkpoint && hasInvalidCheckpointHistory(checkpoint)) {
         pendingSystemByProvider.get(providerID)?.delete(input.sessionID)
-        pendingNativeCompactions.set(input.sessionID, { providerID, checkpoint, completed: false })
+        const messageID = asRecord(input.message)?.id
+        pendingNativeCompactions.set(input.sessionID, {
+          providerID,
+          checkpoint,
+          compactionMessageID: typeof messageID === "string" ? messageID : undefined,
+          completed: false,
+        })
         clearStructuredCapture(input.sessionID)
         output.headers[config.headers.session] = input.sessionID
         output.headers[config.headers.compact] = "native"
