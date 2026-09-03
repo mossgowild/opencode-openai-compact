@@ -131,6 +131,10 @@ function compactReasoningEffort(value: unknown): CompactReasoningEffort | undefi
     : undefined
 }
 
+function compactModelID(model: string | undefined) {
+  return model?.endsWith("-fast") ? model.slice(0, -"-fast".length) : model
+}
+
 function conversationSettingsFrom(messages: MessageEntry[]): ConversationSettings | undefined {
   for (let index = messages.length - 1; index >= 0; index--) {
     const message = messages[index]
@@ -593,7 +597,7 @@ export function compactBody(
   config: OpenAICompactConfig = defaultConfig,
   reasoningEffort = defaultConfig.providers.openai.compactReasoningEffort,
 ): AnyRecord {
-  const model = compactModel ?? (typeof body.model === "string" ? body.model : undefined)
+  const model = compactModelID(compactModel ?? (typeof body.model === "string" ? body.model : undefined))
   const result: AnyRecord = model ? { model } : {}
   for (const key of config.compactBodyKeys) {
     if (key === "model") continue

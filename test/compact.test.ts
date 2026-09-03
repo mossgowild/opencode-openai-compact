@@ -232,6 +232,18 @@ describe("OpenAI compact hooks", () => {
     ])
   })
 
+  test("normalizes Fast model aliases for compaction", () => {
+    expect(
+      compactBody({
+        model: "gpt-5.6-terra-fast",
+        service_tier: "priority",
+        input: [],
+      }),
+    ).toMatchObject({ model: "gpt-5.6-terra", service_tier: "priority" })
+    expect(compactBody({ model: "gpt-5.6-terra", input: [] }).model).toBe("gpt-5.6-terra")
+    expect(compactBody({ model: "ignored", input: [] }, "gpt-5.6-sol-fast").model).toBe("gpt-5.6-sol")
+  })
+
   test("applies explicit compaction model and reasoning effort overrides", () => {
     const config = OpenAICompactConfigSchema.parse({
       providers: { openai: { compactModel: "gpt-compact", compactReasoningEffort: "max" } },
