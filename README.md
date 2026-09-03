@@ -204,5 +204,4 @@ The default retention is 30 days. Checkpoints and control-message records are de
 pnpm install
 pnpm run typecheck
 pnpm run test
-pnpm run build
 ```

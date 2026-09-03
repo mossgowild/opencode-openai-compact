@@ -4,22 +4,21 @@
   "description": "OpenCode plugin that stores OpenAI Responses API compaction checkpoints in SQLite.",
   "type": "module",
   "packageManager": "pnpm@11.21.0",
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "types": "./src/index.ts",
+      "import": "./src/index.ts"
     }
   },
   "files": [
-    "dist",
+    "src",
     "README.md",
     "configSchema.json",
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run"
   },
